@@ -246,7 +246,27 @@ export class S3ChunkReadError extends Error {
   }
 }
 
-/** Returns true if the object exists. Used to skip re-parsing on cache hits. */
+/**
+ * Returns true if the object exists. Used to skip re-parsing on cache hits.
+ *
+ * AWS quirk: a HEAD on a missing object returns 404 ("NotFound") when the
+ * caller has `s3:ListBucket` permission; without it, S3 returns **403**
+ * (Forbidden) to obscure object existence. We can't distinguish "missing
+ * object, no ListBucket" from "object exists, no GetObject" — both look
+ * like a 403 with no specific error code.
+ *
+ * Resolution policy:
+ *   - 404 / NotFound / NoSuchKey → cache miss (object doesn't exist)
+ *   - 403 (without specific code) → ALSO treat as cache miss. Safe because:
+ *       (a) if the object actually exists, the subsequent PUT will overwrite
+ *           it (idempotent — chunks are content-addressed by sha256)
+ *       (b) if the object doesn't exist, we correctly proceed to write
+ *       (c) if PUT is also denied, the user gets a clear PutObject 403
+ *   - any other error → re-raise (real failure: throttle, network, etc.)
+ *
+ * The full IAM grant that avoids the 403-ambiguity is documented in
+ * .env.example (s3:ListBucket on the bucket + GetObject/PutObject on /parsed/*).
+ */
 export async function chunksExist(bucket: string, pdfSha256: string): Promise<boolean> {
   const client = buildClient();
   const key = metadataKey(pdfSha256);
@@ -254,9 +274,22 @@ export async function chunksExist(bucket: string, pdfSha256: string): Promise<bo
     await client.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
     return true;
   } catch (err) {
-    const code = (err as { name?: string }).name;
+    const e = err as { name?: string; $metadata?: { httpStatusCode?: number } };
+    const code = e.name;
     if (code === 'NotFound' || code === 'NoSuchKey') return false;
-    // Other errors (auth, throttle): re-raise — caller decides.
+    const status = e.$metadata?.httpStatusCode;
+    if (status === 403 || status === 404) {
+      // Ambiguous 403 (or rare 404 without specific name). Per the policy
+      // above: treat as cache miss + log so operators can spot the
+      // permission gap when latency or write-overhead matters.
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[s3-chunks] HEAD ${key} returned ${status}; treating as cache miss. ` +
+          `Grant s3:ListBucket to enable cleaner cache-hit semantics.`,
+      );
+      return false;
+    }
+    // Other errors (network, throttle, real auth failure): re-raise.
     throw new S3ChunkReadError(`HEAD failed: ${(err as Error).message}`, bucket, key, err);
   }
 }
