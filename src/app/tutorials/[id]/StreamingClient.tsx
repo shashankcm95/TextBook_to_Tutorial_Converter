@@ -44,6 +44,7 @@
  */
 
 import { useState, useCallback, useMemo, useEffect } from 'react';
+import { useRouter } from 'next/navigation';
 import type { Chapter } from '@/db/schema';
 import type { SourceParagraph, QuizQuestion, LLMFlashcard } from '@/lib/types';
 import { useStreamingChapter, type StreamFrame } from '@/hooks/useStreamingChapter';
@@ -64,6 +65,13 @@ export interface StreamingClientProps {
   initialReviewCards: ReviewableCard[];
   /** CSRF token read from cookie server-side; safe to pass to client island. */
   csrfToken: string;
+  /**
+   * Lazy-hybrid-chunking gating ratchet (Commit 3). Chapters with
+   * ordinal < this value are released for reading; chapters at or above
+   * this value are locked behind the preceding chapter's completion.
+   * Initialized to 0 at ingest (chapter 0 visible only).
+   */
+  maxUnlockedChapterIdx: number;
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -260,7 +268,8 @@ function chapterRowToStreamState(c: Chapter): ChapterStreamState {
 // ───────────────────────────────────────────────────────────────────────────
 
 export function StreamingClient(props: StreamingClientProps) {
-  const { tutorialId, initialChapters, initialReviewCards, csrfToken } = props;
+  const { tutorialId, initialChapters, initialReviewCards, csrfToken, maxUnlockedChapterIdx } = props;
+  const router = useRouter();
 
   // Map<chapterId, ChapterStreamState> — seeded from SSR.
   const [chapterMap, setChapterMap] = useState<Map<string, ChapterStreamState>>(() => {
@@ -471,45 +480,80 @@ export function StreamingClient(props: StreamingClientProps) {
               Waiting for the first chapter…
             </p>
           ) : (
-            orderedChapters.map((c) => (
-              <section key={c.id} aria-labelledby={`ch-${c.id}-title`}>
-                <h2
-                  id={`ch-${c.id}-title`}
-                  className="mb-3 text-xl font-semibold tracking-tight"
-                >
-                  {c.ordinal + 1}. {c.title}
-                </h2>
-                {c.status === 'streaming' ? (
-                  <StreamingProgressIndicator
-                    receivedChars={c.narrative.length}
+            orderedChapters.map((c) => {
+              // ── Commit 3 gating: chapters above the ratchet are LOCKED ──
+              // The ratchet is server-side; client-side gating is UX, not
+              // security. The server's stream endpoint filters by released_at
+              // so locked chapters' content is never generated either.
+              const isLocked = c.ordinal >= maxUnlockedChapterIdx + 1;
+              if (isLocked) {
+                return (
+                  <LockedChapterCard
+                    key={c.id}
+                    ordinal={c.ordinal}
+                    title={c.title}
+                    completePrevOrdinal={maxUnlockedChapterIdx}
                   />
-                ) : c.parsedNarrative !== undefined ? (
-                  <>
-                    <ChapterRenderer
-                      narrative={c.parsedNarrative}
-                      sourceParagraphs={c.sourceParagraphs}
-                    />
-                    {c.parsedQuestions && c.parsedQuestions.length > 0 ? (
-                      <QuizQuestions
-                        questions={c.parsedQuestions}
+                );
+              }
+              // Find the corresponding original chapter row for completion
+              // metadata (completionCriteriaMet — used to decide Mark Complete
+              // CTA visibility).
+              const initialRow = initialChapters.find((ic) => ic.id === c.id);
+              const alreadyMarkedComplete = initialRow?.completionCriteriaMet === true;
+              const canMarkComplete =
+                (c.status === 'complete' || c.parsedNarrative !== undefined) &&
+                !alreadyMarkedComplete;
+              return (
+                <section key={c.id} aria-labelledby={`ch-${c.id}-title`}>
+                  <h2
+                    id={`ch-${c.id}-title`}
+                    className="mb-3 text-xl font-semibold tracking-tight"
+                  >
+                    {c.ordinal + 1}. {c.title}
+                  </h2>
+                  {c.status === 'streaming' ? (
+                    <StreamingProgressIndicator receivedChars={c.narrative.length} />
+                  ) : c.parsedNarrative !== undefined ? (
+                    <>
+                      <ChapterRenderer
+                        narrative={c.parsedNarrative}
                         sourceParagraphs={c.sourceParagraphs}
                       />
-                    ) : null}
-                    {c.parsedFlashcards && c.parsedFlashcards.length > 0 ? (
-                      <ChapterFlashcards flashcards={c.parsedFlashcards} />
-                    ) : null}
-                  </>
-                ) : c.status === 'failed' ? (
-                  <p className="rounded border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
-                    This chapter failed to generate. Retry the tutorial to regenerate.
-                  </p>
-                ) : (
-                  <p className="text-sm text-muted-foreground">
-                    Chapter complete, but the response could not be parsed.
-                  </p>
-                )}
-              </section>
-            ))
+                      {c.parsedQuestions && c.parsedQuestions.length > 0 ? (
+                        <QuizQuestions
+                          questions={c.parsedQuestions}
+                          sourceParagraphs={c.sourceParagraphs}
+                        />
+                      ) : null}
+                      {c.parsedFlashcards && c.parsedFlashcards.length > 0 ? (
+                        <ChapterFlashcards flashcards={c.parsedFlashcards} />
+                      ) : null}
+                      {canMarkComplete ? (
+                        <MarkCompleteButton
+                          tutorialId={tutorialId}
+                          chapterOrdinal={c.ordinal}
+                          csrfToken={csrfToken}
+                          onSuccess={() => router.refresh()}
+                        />
+                      ) : alreadyMarkedComplete ? (
+                        <p className="mt-4 inline-flex items-center gap-1 rounded-full bg-emerald-100 px-3 py-1 text-xs font-medium text-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300">
+                          ✓ Chapter complete
+                        </p>
+                      ) : null}
+                    </>
+                  ) : c.status === 'failed' ? (
+                    <p className="rounded border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+                      This chapter failed to generate. Retry the tutorial to regenerate.
+                    </p>
+                  ) : (
+                    <p className="text-sm text-muted-foreground">
+                      Chapter complete, but the response could not be parsed.
+                    </p>
+                  )}
+                </section>
+              );
+            })
           )}
         </article>
 
@@ -667,6 +711,99 @@ function ChapterFlashcards({ flashcards }: { flashcards: LLMFlashcard[] }) {
         ))}
       </ul>
     </details>
+  );
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Gating UI (Commit 3) — locked card + mark-complete button
+// ───────────────────────────────────────────────────────────────────────────
+
+interface LockedChapterCardProps {
+  ordinal: number;
+  title: string;
+  completePrevOrdinal: number;
+}
+
+function LockedChapterCard({ ordinal, title, completePrevOrdinal }: LockedChapterCardProps) {
+  return (
+    <section
+      aria-label={`Chapter ${ordinal + 1} locked`}
+      className="rounded-md border border-dashed border-border bg-muted/20 px-4 py-5"
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p className="text-xs uppercase tracking-wide text-muted-foreground">Locked</p>
+          <h3 className="mt-1 truncate text-base font-medium text-muted-foreground">
+            {ordinal + 1}. {title}
+          </h3>
+        </div>
+        <span aria-hidden className="text-muted-foreground" title="Locked">
+          🔒
+        </span>
+      </div>
+      <p className="mt-2 text-xs text-muted-foreground">
+        Complete Chapter {completePrevOrdinal + 1} to unlock.
+      </p>
+    </section>
+  );
+}
+
+interface MarkCompleteButtonProps {
+  tutorialId: string;
+  chapterOrdinal: number;
+  csrfToken: string;
+  onSuccess: () => void;
+}
+
+function MarkCompleteButton({ tutorialId, chapterOrdinal, csrfToken, onSuccess }: MarkCompleteButtonProps) {
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function handleClick() {
+    setError(null);
+    setSubmitting(true);
+    try {
+      const res = await fetch(
+        `/api/tutorials/${tutorialId}/chapters/${chapterOrdinal}/complete`,
+        {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-CSRF-Token': csrfToken,
+          },
+          body: JSON.stringify({ signal: 'manual-override' }),
+        },
+      );
+      if (!res.ok) {
+        const body = await res.text().catch(() => '<unreadable>');
+        setError(`HTTP ${res.status}: ${body.slice(0, 200)}`);
+        return;
+      }
+      onSuccess();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'network error');
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <div className="mt-4 flex items-center gap-3">
+      <button
+        type="button"
+        onClick={handleClick}
+        disabled={submitting}
+        className="rounded bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+      >
+        {submitting ? 'Marking complete…' : 'Mark complete & unlock next'}
+      </button>
+      {error ? (
+        <p role="alert" className="text-xs text-destructive">
+          {error}
+        </p>
+      ) : null}
+    </div>
   );
 }
 
