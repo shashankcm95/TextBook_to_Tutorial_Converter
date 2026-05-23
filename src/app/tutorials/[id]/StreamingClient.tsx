@@ -423,6 +423,16 @@ export function StreamingClient(props: StreamingClientProps) {
           timeSpentSeconds: 0,
           lastQuizAttemptAt: null,
           lastQuizScore: null,
+          // ── lazy-hybrid-chunking (0001 migration) defaults for the synthetic
+          // projection. Real values land server-side; these stub-defaults keep
+          // the CompletionTracker type-safe during streaming hydration.
+          classification: 'body' as const,
+          chunkS3Key: null,
+          parentChapterId: null,
+          depth: 0,
+          releasedAt: c.status === 'complete' ? new Date() : null,
+          completionCriteriaMet: false,
+          paragraphCount: 0,
         }) satisfies Chapter,
     );
   }, [orderedChapters, tutorialId]);

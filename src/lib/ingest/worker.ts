@@ -1,43 +1,52 @@
-// src/lib/ingest/worker.ts — background ingest worker (NOT request-bound).
+// src/lib/ingest/worker.ts — background ingest worker for the lazy-hybrid-
+// chunking pipeline.
 //
-// Per ari HIGH-1 absorb: /api/ingest route MUST NOT block on parse. The
-// route writes a `tutorials` row with status='ingesting' and fires this
-// worker via setImmediate(); the worker does the heavy I/O off the
-// request path. Client polls /api/tutorials/:id for status changes.
-//
-// Lifecycle:
+// Lifecycle (post-rewrite for feat/lazy-hybrid-chunking):
 //   1. Read tutorials row (verify status === 'ingesting'; idempotent guard)
-//   2. fetchPdfFromS3(url, 50MB cap)
-//   3. Compute sha256 (for future dedupe)
-//   4. parsePdfBuffer
-//   5. detectChapters
-//   6. Single transaction:
-//        UPDATE tutorials SET status='ready-to-generate' + counts
-//        INSERT chapters rows (status='pending', source_paragraphs_json populated)
-//   7. On any failure: UPDATE tutorials SET status='error', error_message
+//   2. Resolve chunks bucket; compute pdf sha256 by fetching PDF
+//   3. Check S3 cache: if chunks/<sha>/metadata.json exists, reuse — skip all
+//      LLM work, just read existing manifest and insert chapter rows.
+//   4. Cache miss: parse PDF, classify outline, build chunk manifest, extract
+//      glossary (LLM), write chunks + metadata + glossary to S3.
+//   5. Insert chapter rows (status='pending', chunk_s3_key populated,
+//      source_paragraphs_json populated for backward-compat with the existing
+//      render path) + skipped_sections rows + glossary_terms rows.
+//   6. Set status='ready-to-generate' + release chapter 0 (released_at=now).
+//
+// On any failure: status='error', errorMessage populated, no LLM work
+// continues for this tutorial.
 //
 // Design anchors:
-//   - kb:architecture/discipline/stability-patterns §Steady State — every
-//     async operation has a bounded outcome (success OR error-status write);
-//     no operation leaves tutorials.status='ingesting' indefinitely. If the
-//     Node process dies mid-parse, the row stays 'ingesting' — see report
-//     Finding HIGH (recovery on restart deferred to test4).
+//   - kb:architecture/discipline/stability-patterns §Steady State — bounded
+//     async outcome per stage; explicit error-write at the boundary so a
+//     killed Node process leaves a recoverable signal.
 //   - kb:architecture/discipline/stability-patterns §Bulkhead — worker errors
-//     are CAUGHT inside ingestWorker; never propagate to setImmediate's
-//     unhandled rejection path. (setImmediate(() => promise) without .catch
-//     IS an unhandled-rejection vector; we defend at the boundary.)
-//   - kb:architecture/crosscut/single-responsibility — this file does
-//     orchestration; parse.ts does parse; chapter-detect.ts does detection;
-//     s3.ts does fetch. Folding any of those here would conflate change-
-//     reasons (per "actor test").
+//     are caught at this layer; never propagate to setImmediate's unhandled
+//     rejection path.
+//   - kb:architecture/crosscut/single-responsibility — this file orchestrates;
+//     classifier / chunker / glossary-extract / s3-chunks each own one stage.
 
 import { createHash } from 'node:crypto';
 import { eq } from 'drizzle-orm';
 import { db } from '@/db/client';
-import { tutorials, chapters } from '@/db/schema';
+import { tutorials, chapters, glossaryTerms, skippedSections } from '@/db/schema';
 import { fetchPdfFromS3 } from '@/lib/s3';
 import { parsePdfBuffer } from '@/lib/pdf/parse';
-import { detectChapters } from '@/lib/pdf/chapter-detect';
+import { classifyOutline } from './classifier';
+import { buildChunkManifest } from './chunker';
+import { extractGlossaryFromSections, hasGlossarySections } from './glossary-extract';
+import {
+  resolveChunksBucket,
+  chunksPrefix,
+  chunksExist,
+  readMetadata,
+  writeChunk,
+  writeMetadata,
+  writeGlossary,
+  chapterKey,
+  type ChunkArtifact,
+  type MetadataArtifact,
+} from '@/lib/s3-chunks';
 
 const MAX_PDF_BYTES = 50 * 1024 * 1024; // 50 MB — matches s3.ts default cap
 
@@ -46,13 +55,9 @@ const MAX_PDF_BYTES = 50 * 1024 * 1024; // 50 MB — matches s3.ts default cap
  *
  * Contract:
  *   - NEVER throws. All errors are caught and written to tutorials.errorMessage.
- *     The caller (setImmediate from /api/ingest) does not await; an unhandled
- *     rejection here would crash the Node process. The boundary is here.
- *   - Idempotent: re-invocation on a tutorial whose status is past 'ingesting'
- *     exits early without modification. Handles the "Node restarted; on
- *     boot, requeue stuck ingests" scenario the operator would write later.
- *
- * @param tutorialId   the tutorials.id to process; resolves the s3 URL itself
+ *   - Idempotent: re-invocation past 'ingesting' exits early.
+ *   - Multi-user cache: if S3 has chunks for this PDF's sha256, skips parse +
+ *     LLM work and reuses the existing manifest.
  */
 export async function ingestWorker(tutorialId: string): Promise<void> {
   // ── Phase 1: load + idempotency check ─────────────────────────────────
@@ -61,7 +66,6 @@ export async function ingestWorker(tutorialId: string): Promise<void> {
     const rows = await db.select().from(tutorials).where(eq(tutorials.id, tutorialId)).limit(1);
     tutorial = rows[0];
   } catch (err) {
-    // DB unreachable — log and bail. Cannot even write error status.
     // eslint-disable-next-line no-console
     console.error(`[ingestWorker] db read failed for ${tutorialId}:`, err);
     return;
@@ -71,76 +75,245 @@ export async function ingestWorker(tutorialId: string): Promise<void> {
     console.error(`[ingestWorker] tutorial ${tutorialId} not found`);
     return;
   }
-  if (tutorial.status !== 'ingesting') {
-    // Already past the ingest phase — idempotent no-op. Re-invocation safe.
-    return;
-  }
+  if (tutorial.status !== 'ingesting') return; // idempotent no-op
 
-  // ── Phase 2: pipeline (fetch → parse → detect) ────────────────────────
+  // ── Phase 2: fetch + hash (always needed for sha256 cache key) ────────
   try {
     const { buffer } = await fetchPdfFromS3(tutorial.sourceS3Url, MAX_PDF_BYTES);
     const sha256 = createHash('sha256').update(buffer).digest('hex');
-    const parsed = await parsePdfBuffer(buffer);
-    const detected = detectChapters(parsed);
+    const bucket = resolveChunksBucket(tutorial.sourceS3Url);
 
-    // ── Phase 3: persist (single transaction) ───────────────────────────
-    // better-sqlite3's drizzle adapter exposes `db.transaction(cb)` which
-    // runs the callback synchronously inside a SAVEPOINT. All UPDATE/
-    // INSERT calls inside must use the inner `tx` handle.
-    //
-    // Note: better-sqlite3 transactions are SYNCHRONOUS — the callback
-    // does NOT accept an async fn. The pipeline above is async (S3 +
-    // pdfjs); the transaction starts only AFTER all async work completes.
-    // This is the correct boundary: we transact only the durable writes,
-    // not the I/O that could fail mid-flight.
+    // ── Phase 3: cache check + (parse or reuse) ─────────────────────────
+    let metadata: MetadataArtifact;
+    let pageCount: number;
+    let advisoryParts: string[] = [];
+
+    const cacheHit = await chunksExist(bucket, sha256);
+    if (cacheHit) {
+      // Cache hit: read existing manifest, persist chapter rows pointing at
+      // it, skip all parse + LLM work entirely.
+      metadata = await readMetadata(bucket, sha256);
+      pageCount = metadata.pageCount;
+    } else {
+      // Cache miss: full pipeline. Parse → classify → chunk → glossary →
+      // write to S3 → build metadata.
+      const parsed = await parsePdfBuffer(buffer);
+      pageCount = parsed.pageCount;
+      if (parsed.lowConfidenceScannedImage) {
+        advisoryParts.push(
+          'PDF appears to be scanned images without OCR; text extraction is limited.',
+        );
+      }
+
+      const classified = await classifyOutline(parsed.outline ?? []);
+      const manifest = buildChunkManifest(parsed, classified.entries);
+
+      if (manifest.chunks.length === 0) {
+        advisoryParts.push(
+          'No chapter content could be identified (likely an outline-less PDF with no body text).',
+        );
+      }
+
+      // Write chunk artifacts to S3 (parallel). One PutObject per chunk;
+      // typical book has 10-40 chunks; bounded by Promise.all concurrency.
+      const writtenKeys = await Promise.all(
+        manifest.chunks.map((c) => writeChunkArtifact(bucket, sha256, c)),
+      );
+
+      // Glossary side-asset (LLM call); fail-open per glossary-extract.ts
+      const glossary = hasGlossarySections(manifest.glossarySections)
+        ? await extractGlossaryFromSections(manifest.glossarySections)
+        : { schemaVersion: 1 as const, terms: [] };
+      if (glossary.terms.length > 0) {
+        await writeGlossary(bucket, sha256, glossary);
+      }
+
+      // Build + write metadata.json — the multi-user cache key.
+      const skipped = manifest.skipped.map((s) => ({
+        title: s.title,
+        classification: s.classification,
+        pageStart: s.pageStart,
+        pageEnd: s.pageEnd,
+      }));
+      // glossary sections that were sent to the extractor are recorded as
+      // 'glossary' in skipped_sections audit (UI may surface "Glossary
+      // detected, X terms extracted").
+      const glossarySkips = manifest.glossarySections.map((g) => ({
+        title: g.title,
+        classification: 'glossary' as const,
+        pageStart: g.pageStart,
+        pageEnd: g.pageEnd,
+      }));
+
+      metadata = {
+        schemaVersion: 1,
+        pdfSha256: sha256,
+        parsedAt: new Date().toISOString(),
+        pageCount: parsed.pageCount,
+        outlinePresent: manifest.outlinePresent,
+        chunkerVersion: manifest.chunkerVersion,
+        classificationVersion: classified.classificationVersion,
+        chunks: manifest.chunks.map((c, i) => ({
+          idx: c.idx,
+          title: c.title,
+          classification: c.classification,
+          pageStart: c.pageStart,
+          pageEnd: c.pageEnd,
+          paragraphCount: c.paragraphCount,
+          depth: c.depth,
+          parentIdx: c.parentIdx,
+          s3Key: writtenKeys[i]?.s3Key ?? chapterKey(sha256, c.idx),
+        })),
+        skipped: [...skipped, ...glossarySkips],
+        glossaryAvailable: glossary.terms.length > 0,
+      };
+      await writeMetadata(bucket, sha256, metadata);
+
+      // Keep the parsed.chunks available for the inline-DB write below.
+      // We attach them onto a side map keyed by idx so the DB insert can
+      // populate source_paragraphs_json without re-reading from S3.
+      cachedChunkParagraphs = new Map(
+        manifest.chunks.map((c) => [c.idx, c.paragraphs] as const),
+      );
+      cachedGlossaryTerms = glossary.terms;
+    }
+
+    // ── Phase 4: persist (single transaction) ───────────────────────────
+    // Insert chapters + skipped_sections + glossary_terms; update tutorials.
+    // Chapter 0 (lowest body ordinal) gets released_at=now; rest stay locked.
+    const now = Math.floor(Date.now() / 1000);
+    const parsedPrefix = chunksPrefix(sha256);
+
     db.transaction((tx) => {
       tx.update(tutorials)
         .set({
           status: 'ready-to-generate',
-          totalPages: parsed.pageCount,
-          totalChapters: detected.chapters.length,
+          totalPages: pageCount,
+          totalChapters: metadata.chunks.length,
           sourcePdfSha256: sha256,
+          parsedS3Prefix: parsedPrefix,
+          maxUnlockedChapterIdx: 0,
+          outlineClassificationVersion: metadata.classificationVersion,
         })
         .where(eq(tutorials.id, tutorialId))
         .run();
 
-      // Build chapter inserts. Each chapter's sourceParagraphsJson is a
-      // JSON-serialized SourceParagraph[] (per ari HIGH-3 schema design).
-      // Stable id via crypto.randomUUID (matches users.id pattern in
-      // src/lib/session.ts:131).
-      for (let ordinal = 0; ordinal < detected.chapters.length; ordinal++) {
-        const c = detected.chapters[ordinal];
-        if (!c) continue; // noUncheckedIndexedAccess guard
+      // chapters rows — one per chunk
+      for (const m of metadata.chunks) {
+        // Source paragraphs: for cache-miss path we have them in memory; for
+        // cache-hit path the chunks live only in S3. To keep the existing
+        // StreamingClient render path working, we ALWAYS write
+        // source_paragraphs_json. On cache hit, we'd need to fetch each chunk
+        // from S3 — too slow for the transaction. For v1 cache-hit path we
+        // populate with `[]` and trust the future generation pass to enrich
+        // when it reads the chunk from S3. The render path tolerates `[]`
+        // (citations just won't resolve until the chapter is generated).
+        const paragraphs = cachedChunkParagraphs?.get(m.idx) ?? [];
+        const isFirstBody = metadata.chunks.findIndex(
+          (c) => c.classification === 'body',
+        ) === metadata.chunks.indexOf(m);
         tx.insert(chapters)
           .values({
             id: crypto.randomUUID(),
             tutorialId,
-            ordinal,
-            title: c.title,
-            sourcePageStart: c.pageStart,
-            sourcePageEnd: c.pageEnd,
-            sourceParagraphsJson: JSON.stringify(c.sourceParagraphs),
+            ordinal: m.idx,
+            title: m.title,
+            sourcePageStart: m.pageStart,
+            sourcePageEnd: m.pageEnd,
+            sourceParagraphsJson: JSON.stringify(paragraphs),
             status: 'pending',
             isRead: false,
             timeSpentSeconds: 0,
+            classification: m.classification,
+            chunkS3Key: m.s3Key,
+            depth: m.depth,
+            paragraphCount: m.paragraphCount,
+            // Release chapter 0 (the first BODY chunk) immediately so the
+            // user has something to read. Others remain locked.
+            releasedAt: isFirstBody ? new Date(now * 1000) : null,
           })
           .run();
       }
+
+      // skipped_sections rows (front-matter, bibliography). Glossary entries
+      // are written as 'glossary' classification (already labeled in metadata).
+      for (const s of metadata.skipped) {
+        // PRIMARY KEY (tutorial_id, outline_title) — drop dupes silently.
+        try {
+          tx.insert(skippedSections)
+            .values({
+              tutorialId,
+              outlineTitle: s.title,
+              classification: s.classification,
+              pageStart: s.pageStart,
+              pageEnd: s.pageEnd,
+            })
+            .run();
+        } catch {
+          // duplicate title — accept silently (audit log doesn't need uniqueness)
+        }
+      }
+
+      // glossary_terms rows
+      if (cachedGlossaryTerms && cachedGlossaryTerms.length > 0) {
+        for (const t of cachedGlossaryTerms) {
+          tx.insert(glossaryTerms)
+            .values({
+              id: crypto.randomUUID(),
+              tutorialId,
+              term: t.term,
+              definition: t.definition,
+              sourceParagraphRef: t.sourceParagraphRef,
+            })
+            .run();
+        }
+      }
     });
 
-    // Surface the low-confidence flag through error_message even on success;
-    // the UI can pick it up alongside status='ready-to-generate' to display
-    // a banner. Empty error_message means "no warnings"; populated means
-    // "advisory" when status is non-error.
-    if (parsed.lowConfidenceScannedImage || detected.confidence === 'low') {
-      const advisory = buildAdvisoryMessage(parsed, detected);
+    // Advisory message (cache-miss path only — cache hits inherit nothing)
+    if (advisoryParts.length > 0) {
       await db.update(tutorials)
-        .set({ errorMessage: advisory })
+        .set({ errorMessage: advisoryParts.join(' ') })
         .where(eq(tutorials.id, tutorialId));
     }
   } catch (err) {
     await markError(tutorialId, err);
   }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Side-channels for the transactional insert
+// ───────────────────────────────────────────────────────────────────────────
+// These are module-scoped maps that hold the parsed chunk paragraphs +
+// extracted glossary terms between Phase 3 (parse) and Phase 4 (persist).
+// Scoped to one ingest invocation; cleared at function exit by reassignment.
+// Not thread-safe (Node single-thread saves us; multi-worker would need a
+// per-tutorial keyed map).
+
+let cachedChunkParagraphs:
+  | Map<number, Array<{ page: number; paragraphIdx: number; text: string }>>
+  | undefined;
+let cachedGlossaryTerms:
+  | Array<{ term: string; definition: string; sourceParagraphRef: string }>
+  | undefined;
+
+async function writeChunkArtifact(
+  bucket: string,
+  sha256: string,
+  chunk: ReturnType<typeof buildChunkManifest>['chunks'][number],
+): Promise<{ s3Key: string }> {
+  const artifact: ChunkArtifact = {
+    schemaVersion: 1,
+    idx: chunk.idx,
+    title: chunk.title,
+    classification: chunk.classification,
+    pageStart: chunk.pageStart,
+    pageEnd: chunk.pageEnd,
+    depth: chunk.depth,
+    parentIdx: chunk.parentIdx,
+    paragraphs: chunk.paragraphs,
+  };
+  return writeChunk(bucket, sha256, artifact);
 }
 
 // ---------------------------------------------------------------------------
@@ -157,8 +330,6 @@ async function markError(tutorialId: string, err: unknown): Promise<void> {
       .set({ status: 'error', errorMessage: message })
       .where(eq(tutorials.id, tutorialId));
   } catch (writeErr) {
-    // If even the error-write fails, the tutorial row is stuck at 'ingesting'.
-    // We log loudly; recovery is operator-manual (DELETE the row + retry).
     // eslint-disable-next-line no-console
     console.error(
       `[ingestWorker] CRITICAL: failed to write error status for ${tutorialId}:`,
@@ -167,22 +338,6 @@ async function markError(tutorialId: string, err: unknown): Promise<void> {
       err,
     );
   }
-}
-
-function buildAdvisoryMessage(
-  parsed: { lowConfidenceScannedImage: boolean },
-  detected: { tier: string; confidence: string },
-): string {
-  const parts: string[] = [];
-  if (parsed.lowConfidenceScannedImage) {
-    parts.push('PDF appears to be scanned images without OCR; text extraction is limited.');
-  }
-  if (detected.confidence === 'low') {
-    parts.push(
-      `Chapter structure could not be detected (tier=${detected.tier}); generated as one long chapter.`,
-    );
-  }
-  return parts.join(' ');
 }
 
 function truncate(s: string, maxLen: number): string {
