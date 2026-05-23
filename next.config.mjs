@@ -28,6 +28,13 @@ const nextConfig = {
     serverActions: {
       bodySizeLimit: '50mb',
     },
+    // FINDING-PDF-1 (Phase 5): pdfjs-dist 4.x is ESM-only and webpack tries
+    // to bundle pdf.worker.mjs as a dependency, which fails. Marking it as
+    // a server external lets Node's native resolver handle it at runtime,
+    // and lets us use `createRequire(import.meta.url).resolve(...)` to point
+    // GlobalWorkerOptions.workerSrc at the real on-disk worker file.
+    // better-sqlite3 is native (.node binary), also must not be bundled.
+    serverComponentsExternalPackages: ['pdfjs-dist', 'better-sqlite3'],
   },
   images: {
     remotePatterns: [],

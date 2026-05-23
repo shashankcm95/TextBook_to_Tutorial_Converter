@@ -50,12 +50,13 @@ export function HomeIngestForm({ prefillUrl }: { prefillUrl: string }) {
       });
 
       if (res.status === 202) {
-        const data = (await res.json()) as { tutorialId?: string };
-        if (data.tutorialId) {
-          router.push(`/tutorials/${data.tutorialId}`);
+        // POST /api/ingest returns { id, status } — see route.ts:171.
+        const data = (await res.json()) as { id?: string };
+        if (data.id) {
+          router.push(`/tutorials/${data.id}`);
           return;
         }
-        setError('Ingest accepted but no tutorialId returned.');
+        setError('Ingest accepted but no id returned.');
       } else {
         const body = await res.text().catch(() => '<unreadable>');
         setError(`HTTP ${res.status}: ${body.slice(0, 200)}`);
