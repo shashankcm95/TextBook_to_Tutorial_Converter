@@ -54,10 +54,14 @@ export const PRICING_USD_PER_1M = {
 
 export type SupportedModel = keyof typeof PRICING_USD_PER_1M;
 
-// Tiktoken encoding map. cl100k_base is used by gpt-4 + gpt-4o family.
-// If we add a gpt-5/o200k_base model, extend here.
+// Tiktoken encoding map. gpt-4o + gpt-4o-mini both use o200k_base.
+// FINDING-MODEL-1 (Phase 5): tiktoken@1.0.15 doesn't recognize 'gpt-4o-mini'
+// as a model name (added in later releases) but DOES know 'gpt-4o' — they
+// share the same o200k_base encoding, so we route both lookups through
+// 'gpt-4o' for token counting. The billing-side model string sent to OpenAI
+// is unchanged.
 const ENCODING_FOR_MODEL: Record<SupportedModel, TiktokenModel> = {
-  'gpt-4o-mini': 'gpt-4o-mini',
+  'gpt-4o-mini': 'gpt-4o',
   'gpt-4o': 'gpt-4o',
 };
 

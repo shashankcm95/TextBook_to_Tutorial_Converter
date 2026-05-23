@@ -21,8 +21,8 @@
 CREATE TABLE `users` (
   `id` text PRIMARY KEY NOT NULL,
   `session_cookie_hash` text NOT NULL,
-  `created_at` integer DEFAULT (CURRENT_TIMESTAMP) NOT NULL,
-  `last_seen_at` integer DEFAULT (CURRENT_TIMESTAMP) NOT NULL
+  `created_at` integer DEFAULT (unixepoch()) NOT NULL,
+  `last_seen_at` integer DEFAULT (unixepoch()) NOT NULL
 );
 --> statement-breakpoint
 CREATE UNIQUE INDEX `users_session_cookie_hash_unique` ON `users` (`session_cookie_hash`);
@@ -42,7 +42,7 @@ CREATE TABLE `tutorials` (
   `error_message` text,
   `total_pages` integer,
   `total_chapters` integer,
-  `created_at` integer DEFAULT (CURRENT_TIMESTAMP) NOT NULL,
+  `created_at` integer DEFAULT (unixepoch()) NOT NULL,
   FOREIGN KEY (`user_id`) REFERENCES `users`(`id`) ON UPDATE no action ON DELETE cascade,
   CHECK (`status` IN ('ingesting','parsing','ready-to-generate','generating','complete','error'))
 );
@@ -151,7 +151,7 @@ CREATE TABLE `parses_cost` (
   `completion_tokens` integer NOT NULL,
   `cost_usd` real NOT NULL,
   `validation_drop_count` integer DEFAULT 0 NOT NULL,
-  `created_at` integer DEFAULT (CURRENT_TIMESTAMP) NOT NULL,
+  `created_at` integer DEFAULT (unixepoch()) NOT NULL,
   FOREIGN KEY (`tutorial_id`) REFERENCES `tutorials`(`id`) ON UPDATE no action ON DELETE cascade,
   FOREIGN KEY (`chapter_id`) REFERENCES `chapters`(`id`) ON UPDATE no action ON DELETE cascade,
   CHECK (`prompt_tokens` >= 0),

@@ -45,7 +45,7 @@
 
 import { useState, useCallback, useMemo, useEffect } from 'react';
 import type { Chapter } from '@/db/schema';
-import type { SourceParagraph } from '@/lib/types';
+import type { SourceParagraph, QuizQuestion, LLMFlashcard } from '@/lib/types';
 import { useStreamingChapter, type StreamFrame } from '@/hooks/useStreamingChapter';
 import { ChapterRenderer } from '@/components/ChapterRenderer';
 import { CostChip } from '@/components/CostChip';
@@ -75,12 +75,47 @@ interface ChapterStreamState {
   id: string;
   ordinal: number;
   title: string;
-  /** Accumulated narrative text — grows as tokens stream in. */
+  /** Accumulated narrative text — grows as tokens stream in. Holds raw JSON
+   *  while the LLM emits structured output; parsed into parsedNarrative on
+   *  chapter-complete. See FINDING-RENDER-1 fix. */
   narrative: string;
   /** Status: 'streaming' until chapter-complete, then 'complete'. */
   status: 'streaming' | 'complete' | 'failed';
   /** SourceParagraph index for citation resolution. */
   sourceParagraphs: SourceParagraph[];
+  /** Markdown narrative parsed out of the structured-output JSON. Only set
+   *  once the chapter completes and the JSON parses cleanly. */
+  parsedNarrative?: string;
+  /** Quiz questions parsed out of the structured-output JSON. */
+  parsedQuestions?: QuizQuestion[];
+  /** Flashcards parsed out of the structured-output JSON. */
+  parsedFlashcards?: LLMFlashcard[];
+}
+
+/**
+ * Parse the accumulated streaming JSON into typed parts.
+ * Returns null if the text isn't valid JSON yet (mid-stream) or if the shape
+ * doesn't match the expected chapter-gen contract.
+ * FINDING-RENDER-1 (Phase 5).
+ */
+function parseStructuredChapter(text: string): {
+  narrative: string;
+  questions: QuizQuestion[];
+  flashcards: LLMFlashcard[];
+} | null {
+  if (!text || text[0] !== '{') return null;
+  let obj: unknown;
+  try {
+    obj = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (typeof obj !== 'object' || obj === null) return null;
+  const o = obj as Record<string, unknown>;
+  if (typeof o.narrative !== 'string') return null;
+  const questions = Array.isArray(o.questions) ? (o.questions as QuizQuestion[]) : [];
+  const flashcards = Array.isArray(o.flashcards) ? (o.flashcards as LLMFlashcard[]) : [];
+  return { narrative: o.narrative, questions, flashcards };
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -191,13 +226,32 @@ function chapterRowToStreamState(c: Chapter): ChapterStreamState {
   } catch {
     sp = [];
   }
+  // For SSR-hydrated rows that are already complete, the worker persists the
+  // narrative-only markdown (NOT the full JSON), and questions/flashcards
+  // land in their own tables. So on hydration: treat the persisted narrative
+  // string as the parsed markdown directly; questions + flashcards will be
+  // empty (loaded separately by future iteration). FINDING-RENDER-1 fix.
+  const raw = c.narrative ?? '';
+  // Defensive: if a prior buggy worker run persisted raw JSON, recover by
+  // parsing — keeps old rows readable after the fix.
+  const parsedFromJson = c.status === 'complete' ? parseStructuredChapter(raw) : null;
+  // 'partial' status means narrative is present but some questions/flashcards
+  // were dropped during source_paragraph_ref validation. From the reader's
+  // perspective it's still complete content; surface it the same way.
+  const isReadable = c.status === 'complete' || c.status === 'partial';
+  const parsedNarrative =
+    parsedFromJson?.narrative ??
+    (isReadable ? raw : undefined);
   return {
     id: c.id,
     ordinal: c.ordinal,
     title: c.title,
-    narrative: c.narrative ?? '',
-    status: c.status === 'complete' ? 'complete' : c.status === 'failed' ? 'failed' : 'streaming',
+    narrative: raw,
+    status: isReadable ? 'complete' : c.status === 'failed' ? 'failed' : 'streaming',
     sourceParagraphs: sp,
+    parsedNarrative,
+    parsedQuestions: parsedFromJson?.questions,
+    parsedFlashcards: parsedFromJson?.flashcards,
   };
 }
 
@@ -290,7 +344,14 @@ export function StreamingClient(props: StreamingClientProps) {
           const existing = prev.get(payload.chapterId);
           if (!existing) return prev;
           const next = new Map(prev);
-          next.set(payload.chapterId, { ...existing, status: 'complete' });
+          const parsed = parseStructuredChapter(existing.narrative);
+          next.set(payload.chapterId, {
+            ...existing,
+            status: 'complete',
+            parsedNarrative: parsed?.narrative,
+            parsedQuestions: parsed?.questions,
+            parsedFlashcards: parsed?.flashcards,
+          });
           return next;
         });
         return;
@@ -408,18 +469,35 @@ export function StreamingClient(props: StreamingClientProps) {
                 >
                   {c.ordinal + 1}. {c.title}
                 </h2>
-                <ChapterRenderer
-                  narrative={c.narrative}
-                  sourceParagraphs={c.sourceParagraphs}
-                />
                 {c.status === 'streaming' ? (
-                  <p
-                    aria-live="polite"
-                    className="mt-2 text-xs italic text-muted-foreground"
-                  >
-                    Generating…
+                  <StreamingProgressIndicator
+                    receivedChars={c.narrative.length}
+                  />
+                ) : c.parsedNarrative !== undefined ? (
+                  <>
+                    <ChapterRenderer
+                      narrative={c.parsedNarrative}
+                      sourceParagraphs={c.sourceParagraphs}
+                    />
+                    {c.parsedQuestions && c.parsedQuestions.length > 0 ? (
+                      <QuizQuestions
+                        questions={c.parsedQuestions}
+                        sourceParagraphs={c.sourceParagraphs}
+                      />
+                    ) : null}
+                    {c.parsedFlashcards && c.parsedFlashcards.length > 0 ? (
+                      <ChapterFlashcards flashcards={c.parsedFlashcards} />
+                    ) : null}
+                  </>
+                ) : c.status === 'failed' ? (
+                  <p className="rounded border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+                    This chapter failed to generate. Retry the tutorial to regenerate.
                   </p>
-                ) : null}
+                ) : (
+                  <p className="text-sm text-muted-foreground">
+                    Chapter complete, but the response could not be parsed.
+                  </p>
+                )}
               </section>
             ))
           )}
@@ -492,6 +570,95 @@ const STATUS_CLASSES: Record<ReturnType<typeof useStreamingChapter>['status'], s
   done: 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300',
   failed: 'bg-destructive/10 text-destructive',
 };
+
+// ───────────────────────────────────────────────────────────────────────────
+// Per-chapter inline surfaces (FINDING-RENDER-1 fix, Phase 5)
+// ───────────────────────────────────────────────────────────────────────────
+
+function StreamingProgressIndicator({ receivedChars }: { receivedChars: number }) {
+  // Show progress as a friendly chip while the LLM emits structured JSON.
+  // We deliberately do NOT show the raw JSON — it's visually noisy and
+  // unhelpful to the reader. Once chapter-complete fires, the parent
+  // re-renders this section as markdown + questions + flashcards.
+  return (
+    <div className="rounded-md border border-dashed border-border bg-muted/30 px-4 py-6 text-center">
+      <p
+        aria-live="polite"
+        className="text-sm italic text-muted-foreground"
+      >
+        Generating chapter…
+      </p>
+      <p className="mt-1 text-xs text-muted-foreground/70">
+        {receivedChars.toLocaleString()} chars received
+      </p>
+    </div>
+  );
+}
+
+interface QuizQuestionsProps {
+  questions: QuizQuestion[];
+  sourceParagraphs: SourceParagraph[];
+}
+
+function QuizQuestions({ questions }: QuizQuestionsProps) {
+  return (
+    <details className="mt-6 rounded border border-border bg-card/40">
+      <summary className="cursor-pointer px-4 py-2 text-sm font-medium hover:bg-accent/30">
+        Quiz · {questions.length} question{questions.length === 1 ? '' : 's'}
+      </summary>
+      <ol className="space-y-4 px-4 py-3 text-sm">
+        {questions.map((q, i) => (
+          <li key={i} className="space-y-2">
+            <p className="font-medium">
+              {i + 1}. {q.prompt}
+            </p>
+            <ul className="ml-4 list-disc space-y-1 text-muted-foreground">
+              {q.options.map((opt, j) => (
+                <li
+                  key={j}
+                  className={
+                    j === q.correctIndex
+                      ? 'text-emerald-700 dark:text-emerald-300'
+                      : ''
+                  }
+                >
+                  {opt}
+                  {j === q.correctIndex ? ' ✓' : ''}
+                </li>
+              ))}
+            </ul>
+            {q.explanation ? (
+              <p className="text-xs italic text-muted-foreground">
+                {q.explanation}
+              </p>
+            ) : null}
+          </li>
+        ))}
+      </ol>
+    </details>
+  );
+}
+
+function ChapterFlashcards({ flashcards }: { flashcards: LLMFlashcard[] }) {
+  return (
+    <details className="mt-3 rounded border border-border bg-card/40">
+      <summary className="cursor-pointer px-4 py-2 text-sm font-medium hover:bg-accent/30">
+        Flashcards · {flashcards.length}
+      </summary>
+      <ul className="grid gap-2 px-4 py-3 text-sm sm:grid-cols-2">
+        {flashcards.map((f, i) => (
+          <li
+            key={i}
+            className="rounded border border-border/60 bg-background px-3 py-2"
+          >
+            <p className="font-medium">{f.front}</p>
+            <p className="mt-1 text-xs text-muted-foreground">{f.back}</p>
+          </li>
+        ))}
+      </ul>
+    </details>
+  );
+}
 
 interface ProtocolErrorBannerProps {
   code: string;

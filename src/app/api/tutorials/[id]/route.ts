@@ -27,6 +27,26 @@ import { verifySession, SESSION_COOKIE_NAME } from '@/lib/session';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
+/**
+ * Defensive timestamp serializer.
+ *
+ * Drizzle `mode: 'timestamp'` columns *should* hydrate as `Date` objects,
+ * but historical rows written with a `CURRENT_TIMESTAMP` SQL default land
+ * as ISO TEXT in an INTEGER column → Drizzle returns `new Date(NaN)`.
+ * Guard against `getTime()` NaN so the GET handler never throws
+ * `RangeError: Invalid time value`. See PHASE-5 FINDING-API-2.
+ */
+function serializeTimestamp(value: unknown): string | null {
+  if (value instanceof Date) {
+    return Number.isFinite(value.getTime()) ? value.toISOString() : null;
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return new Date(value * 1000).toISOString();
+  }
+  if (typeof value === 'string' && value.length > 0) return value;
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // GET /api/tutorials/:id
 // ---------------------------------------------------------------------------
@@ -89,7 +109,7 @@ export async function GET(
       errorMessage: row.errorMessage,
       totalPages: row.totalPages,
       totalChapters: row.totalChapters,
-      createdAt: row.createdAt instanceof Date ? row.createdAt.toISOString() : row.createdAt,
+      createdAt: serializeTimestamp(row.createdAt),
     },
     { status: 200, headers: { 'Cache-Control': 'no-store' } },
   );

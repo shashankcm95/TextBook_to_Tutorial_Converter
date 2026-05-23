@@ -34,8 +34,29 @@
 //     throw immediately (PdfParseError) rather than returning empty results;
 //     the caller (worker) decides whether to mark tutorial='error' or retry.
 
-import { getDocument } from 'pdfjs-dist/legacy/build/pdf.mjs';
+import { getDocument, GlobalWorkerOptions } from 'pdfjs-dist/legacy/build/pdf.mjs';
+import { join } from 'node:path';
 import type { SourceParagraph } from '@/lib/types';
+
+// pdfjs-dist 4.x requires a worker file path even on Node — the legacy build
+// uses a "fake worker" that runs on the main thread, but the spin-up code
+// still resolves `workerSrc` and errors out if it's empty.
+//
+// We can NOT use `require.resolve('pdfjs-dist/.../pdf.worker.mjs')` because
+// webpack statically analyzes that and tries to bundle the worker as ESM,
+// failing with "ESM packages need to be imported." Instead, build the path
+// at runtime from process.cwd() so webpack sees only an opaque string.
+//
+// CWD is the project root in both `next dev` and `next start`, so the
+// node_modules walk is stable. See PHASE-5 FINDING-PDF-1.
+GlobalWorkerOptions.workerSrc = join(
+  process.cwd(),
+  'node_modules',
+  'pdfjs-dist',
+  'legacy',
+  'build',
+  'pdf.worker.mjs',
+);
 
 // ---------------------------------------------------------------------------
 // Types
@@ -114,6 +135,7 @@ export async function parsePdfBuffer(buffer: Buffer): Promise<ParsedPdf> {
       verbosity: 0,            // suppress pdfjs warnings to stderr
       disableFontFace: true,   // Node has no font rendering; skip the work
       useSystemFonts: false,   // same
+      isEvalSupported: false,  // Node-side: avoid worker eval path entirely
     });
     pdfDoc = await loadingTask.promise;
   } catch (err) {
