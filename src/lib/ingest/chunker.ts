@@ -38,11 +38,23 @@ import type { ClassifiedOutlineEntry, OutlineClassification } from './classifier
 // Tuning knobs
 // ───────────────────────────────────────────────────────────────────────────
 
-/** Max paragraphs per chunk before descent / hard-split kicks in. */
-export const MAX_PARAGRAPHS_PER_CHUNK = 100;
+/**
+ * Max paragraphs per chunk before descent / hard-split kicks in.
+ *
+ * Tuned to ~200 in DDIA Phase-5 UAT: at 100, the walker descended too eagerly
+ * past natural section boundaries (Reliability / Scalability / Maintainability)
+ * into sub-sub-sections (Hardware Faults / Software Errors) — 215 chunks for
+ * DDIA. At 200, sections fit as units; result ≈ 50-80 chunks, one per
+ * coherent reading topic.
+ *
+ * Token budget: 200 paragraphs × ~50 tokens ≈ 10K input + ~2K system prompt
+ * + ~4K max_tokens completion ≈ 16K total per call. Comfortable margin under
+ * gpt-4o's 30K TPM-per-request ceiling (Tier 1).
+ */
+export const MAX_PARAGRAPHS_PER_CHUNK = 200;
 
 /** Target paragraphs per hard-split sub-chunk (when outline can't help). */
-export const HARD_SPLIT_TARGET_PARAGRAPHS = 70;
+export const HARD_SPLIT_TARGET_PARAGRAPHS = 140;
 
 /** Schema version of THIS chunker; bump on any boundary-algorithm change. */
 export const CHUNKER_VERSION = 1;
@@ -131,8 +143,16 @@ function filterValid(
 }
 
 /**
- * Compute pageEnd for each entry as `next entry's pageNumber - 1` in flat
- * document order. The last entry's pageEnd is the PDF's total pageCount.
+ * Compute pageEnd for each entry as `next-non-descendant's pageNumber - 1`,
+ * i.e. the next entry j > i where entry[j].depth <= entry[i].depth.
+ *
+ * This is the CORRECT subtree-aware page range. A parent's range covers ALL
+ * of its descendants — Part I extends through Chapter 1, 2, 3, 4; Chapter 1
+ * extends through its subsections. Naïve "next-flat-entry" pageEnd would
+ * truncate Part I to just its title page (pageEnd = Chapter1.pageStart - 1)
+ * which made walk() emit tiny parent chunks and miss the real content.
+ *
+ * Complexity: O(N²) worst case, but textbook outlines have N ≤ ~500 entries.
  */
 function computeRanges(
   entries: Array<ClassifiedOutlineEntry & { pageNumber: number }>,
@@ -142,10 +162,16 @@ function computeRanges(
   for (let i = 0; i < entries.length; i++) {
     const entry = entries[i];
     if (!entry) continue;
-    const next = entries[i + 1];
-    const rawEnd = next ? next.pageNumber - 1 : pageCount;
-    const pageEnd = Math.max(entry.pageNumber, rawEnd);
-    out.push({ ...entry, pageEnd });
+    let pageEnd = pageCount;
+    for (let j = i + 1; j < entries.length; j++) {
+      const next = entries[j];
+      if (!next) continue;
+      if (next.depth <= entry.depth) {
+        pageEnd = next.pageNumber - 1;
+        break;
+      }
+    }
+    out.push({ ...entry, pageEnd: Math.max(entry.pageNumber, pageEnd) });
   }
   return out;
 }
@@ -293,6 +319,11 @@ function walk(
       paragraphs,
       paragraphCount: paragraphs.length,
     });
+    // Do NOT descend — node.pageEnd already covers all descendants (via the
+    // subtree-aware computeRanges). Descending would double-emit the same
+    // content. The trade-off: deeper outline detail is lost as separate
+    // navigation units when the parent fits. UI can reconstruct nesting from
+    // metadata.json if needed.
     return;
   }
 
