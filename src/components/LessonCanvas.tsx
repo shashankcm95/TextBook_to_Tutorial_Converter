@@ -70,9 +70,14 @@ export function LessonCanvas({ children, isFirstLesson = false }: LessonCanvasPr
         // Lists
         '[&_ul]:mt-lead [&_ul]:list-disc [&_ul]:pl-6 [&_ul_li]:mt-1',
         '[&_ol]:mt-lead [&_ol]:list-decimal [&_ol]:pl-6 [&_ol_li]:mt-1',
-        // Optional drop-cap on lesson 1 / chapter 1 (Stripe-Press-quiet)
+        // Optional drop-cap on lesson 1 / chapter 1 (Stripe-Press-quiet).
+        // Sprint C Phase 1: editorial, not ornamental. text-ink (not brand)
+        // so the cap reads as typographic, not as a chrome accent;
+        // explicit 4.5rem (smaller than text-display) and tighter
+        // leading-0.82 with pt-0.1em for optical alignment with the body
+        // x-height. mt-1 removed in favor of the padding-top optical shift.
         isFirstLesson
-          ? '[&>p:first-of-type::first-letter]:font-display [&>p:first-of-type::first-letter]:text-display [&>p:first-of-type::first-letter]:float-left [&>p:first-of-type::first-letter]:mr-2 [&>p:first-of-type::first-letter]:mt-1 [&>p:first-of-type::first-letter]:leading-[0.85] [&>p:first-of-type::first-letter]:text-brand'
+          ? '[&>p:first-of-type::first-letter]:font-display [&>p:first-of-type::first-letter]:text-[4.5rem] [&>p:first-of-type::first-letter]:float-left [&>p:first-of-type::first-letter]:mr-3 [&>p:first-of-type::first-letter]:leading-[0.82] [&>p:first-of-type::first-letter]:pt-[0.1em] [&>p:first-of-type::first-letter]:text-ink'
           : '',
       ].join(' ')}
     >

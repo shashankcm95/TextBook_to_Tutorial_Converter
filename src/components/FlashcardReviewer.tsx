@@ -362,9 +362,14 @@ export function FlashcardReviewer({ cards, csrfToken, onGraded }: FlashcardRevie
               </div>
             </div>
 
-            {/* BACK face — answer */}
+            {/* BACK face — answer.
+                Sprint C Phase 1: brand-fade (not citation-fade) for
+                color-consistency. Citation-gold stays reserved for source-
+                quote provenance chips; the flashcard back is interaction
+                surface, not provenance, so it should sit in the brand
+                family with the rest of the UI. */}
             <div
-              className="absolute inset-0 flex flex-col rounded-lg border border-citation/40 bg-citation-fade px-6 py-5 shadow-paper group-hover:shadow-paper-lg"
+              className="absolute inset-0 flex flex-col rounded-lg border border-brand/30 bg-brand-fade px-6 py-5 shadow-paper group-hover:shadow-paper-lg"
               style={{
                 backfaceVisibility: 'hidden',
                 WebkitBackfaceVisibility: 'hidden',

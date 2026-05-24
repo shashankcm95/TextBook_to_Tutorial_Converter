@@ -76,6 +76,8 @@ function makeAnchor(
 }
 
 // Subset of fidelity rules that MUST survive every call (regression canaries).
+// Sprint C Phase 1: extended with Rules D + E (Professor round-2 HIGH #2 —
+// silent-delete risk on the negative-rules block shipped in PR #22).
 const EXISTING_RULE_FRAGMENTS = [
   'FIDELITY RULES',
   '1. PRESERVE CONCRETE ANCHORS.',
@@ -88,6 +90,8 @@ const EXISTING_RULE_FRAGMENTS = [
   'A. NO LLM BOILERPLATE OPENERS OR CLOSERS.',
   'B. NO GENERIC ABSTRACTION-FIRST INTROS.',
   'C. NO PARAPHRASING NAMED TECHNIQUES INTO GENERIC DESCRIPTIONS.',
+  'D. FORBIDDEN-PHRASE LINT',
+  'E. ORPHAN DISCOURSE MARKER LINT',
 ];
 
 function expectExistingRulesPresent(prompt: string): void {

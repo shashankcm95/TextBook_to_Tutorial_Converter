@@ -205,6 +205,13 @@
   .border-paper-edge { border-color: hsl(var(--paper-edge)); }
   .border-brand      { border-color: hsl(var(--brand)); }
   .border-citation   { border-color: hsl(var(--citation)); }
+  /* Sprint C Phase 1: semantic border utilities so warn / success / danger /
+     info accents can frame their badges + cards without resorting to raw
+     hex. Same hsl-var pattern as the existing color borders above. */
+  .border-warn       { border-color: hsl(var(--warn)); }
+  .border-success    { border-color: hsl(var(--success)); }
+  .border-danger     { border-color: hsl(var(--danger)); }
+  .border-info       { border-color: hsl(var(--info)); }
   .ring-brand        { --tw-ring-color: hsl(var(--brand)); }
 
   /* ── Typography: families ──────────────────────────────────────────── */

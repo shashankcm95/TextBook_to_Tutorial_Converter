@@ -109,8 +109,12 @@ export function TutorialHeader({
             <p className="flex items-center gap-1.5 truncate text-caption text-ink-muted">
               <span className="truncate">{author}</span>
               {showAttributionBadge ? (
+                // Sprint C Phase 1: route through --warn tokens. The badge
+                // is a *warning* (heuristic attribution, verify before
+                // citing), not source provenance — keep citation-gold
+                // reserved for actual source-quote chips.
                 <span
-                  className="inline-flex shrink-0 items-center gap-0.5 rounded-sm border border-citation/40 bg-citation/10 px-1 py-px font-sans text-micro font-medium uppercase tracking-wide text-citation"
+                  className="inline-flex shrink-0 items-center gap-0.5 rounded-sm border border-warn/40 bg-warn-fade px-1 py-px font-sans text-micro font-medium uppercase tracking-wide text-warn"
                   title="Author was auto-detected from the source filename heuristic, not extracted from the PDF metadata. Verify before citing."
                   aria-label="Author auto-detected from filename — verify before citing"
                 >
