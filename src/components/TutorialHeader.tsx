@@ -27,7 +27,7 @@
 
 import { ProgressRing } from './ProgressRing';
 import { CostChip } from './CostChip';
-import { ChevronRight, BookOpen } from 'lucide-react';
+import { ChevronRight, BookOpen, AlertTriangle } from 'lucide-react';
 
 interface TutorialHeaderProps {
   /** Book title — when absent, falls back to "Untitled tutorial". */
@@ -49,6 +49,20 @@ interface TutorialHeaderProps {
   };
   /** Tutorial id — passed through to CostChip. */
   tutorialId: string;
+  /**
+   * Whether the displayed bookTitle + author came from a high-confidence
+   * source (e.g., the "Title - Author.pdf" delimiter). When false AND an
+   * author is shown, the header renders an "auto-detected" badge so the
+   * reader knows the attribution is a filename heuristic, not a verified
+   * fact. Defaults to true (don't show the badge unless the caller
+   * explicitly signals low confidence).
+   *
+   * Round-2 author critique: a rename attack (file uploaded as
+   * "Some Other Book - Martin Kleppmann.pdf") would otherwise silently
+   * attach Kleppmann's name to a work he didn't write. The badge is the
+   * stop-gap UI signal until ingest extracts metadata from the PDF itself.
+   */
+  attributionHighConfidence?: boolean;
 }
 
 export function TutorialHeader({
@@ -58,8 +72,14 @@ export function TutorialHeader({
   completionPct,
   currentChapter,
   tutorialId,
+  attributionHighConfidence = true,
 }: TutorialHeaderProps) {
   const titleText = bookTitle && bookTitle.trim().length > 0 ? bookTitle : 'Untitled tutorial';
+  // Show the badge ONLY when an author is being displayed AND the caller
+  // signals low confidence. Without an author there's nothing to qualify;
+  // with high confidence the delimiter source is unambiguous.
+  const showAttributionBadge =
+    !attributionHighConfidence && typeof author === 'string' && author.trim().length > 0;
   return (
     <header className="sticky top-0 z-20 border-b border-paper-edge bg-paper-deep/85 backdrop-blur-md">
       <div className="mx-auto flex max-w-6xl items-center gap-4 px-gutter py-3">
@@ -86,7 +106,19 @@ export function TutorialHeader({
             {titleText}
           </h1>
           {author ? (
-            <p className="truncate text-caption text-ink-muted">{author}</p>
+            <p className="flex items-center gap-1.5 truncate text-caption text-ink-muted">
+              <span className="truncate">{author}</span>
+              {showAttributionBadge ? (
+                <span
+                  className="inline-flex shrink-0 items-center gap-0.5 rounded-sm border border-citation/40 bg-citation/10 px-1 py-px font-sans text-micro font-medium uppercase tracking-wide text-citation"
+                  title="Author was auto-detected from the source filename heuristic, not extracted from the PDF metadata. Verify before citing."
+                  aria-label="Author auto-detected from filename — verify before citing"
+                >
+                  <AlertTriangle aria-hidden="true" className="h-2.5 w-2.5" />
+                  Auto-detected
+                </span>
+              ) : null}
+            </p>
           ) : null}
         </div>
 

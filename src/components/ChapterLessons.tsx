@@ -38,12 +38,19 @@ export interface ChapterLessonsProps {
   /** Render-prop for the extras shown ONLY on the last lesson. Typically:
    *  quiz <details>, flashcards <details>, and the Mark Complete button. */
   renderLastLessonExtras?: () => React.ReactNode;
+  /** Whether this chapter is chapter ordinal 0 (the FIRST chapter of the
+   *  tutorial). Gates the drop-cap together with the local lesson index:
+   *  the editorial moment fires ONLY on the very first paragraph of the
+   *  very first lesson. Defaults to false; caller (StreamingClient)
+   *  passes `c.ordinal === 0`. */
+  isFirstChapter?: boolean;
 }
 
 export function ChapterLessons({
   narrative,
   sourceParagraphs,
   renderLastLessonExtras,
+  isFirstChapter = false,
 }: ChapterLessonsProps) {
   // Parse once per narrative change. Tiny regex pass; useMemo is mostly to
   // keep the array reference stable for downstream effects (the nav buttons
@@ -127,7 +134,11 @@ export function ChapterLessons({
       {/* Lesson body — full ChapterRenderer with citation resolution stays
           the load-bearing renderer. We just feed it a single lesson's body
           instead of the whole narrative. */}
-      <ChapterRenderer narrative={current.body} sourceParagraphs={sourceParagraphs} />
+      <ChapterRenderer
+        narrative={current.body}
+        sourceParagraphs={sourceParagraphs}
+        isFirstLesson={isFirstChapter && safeIdx === 0}
+      />
 
       {/* Nav controls — only when paginated. The Continue/Prev buttons use
           aria-disabled (not the `disabled` attr) so keyboard users can still

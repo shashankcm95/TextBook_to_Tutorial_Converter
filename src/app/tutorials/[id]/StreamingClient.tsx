@@ -602,6 +602,12 @@ export function StreamingClient(props: StreamingClientProps) {
   // ("Untitled tutorial" with no author line).
   const bookTitle = bookMetadata?.bookTitle ?? '';
   const bookAuthor = bookMetadata?.author ?? '';
+  // Round-2 (Author): when book-metadata derivation is low-confidence
+  // (e.g., the known-surname-prefix heuristic, no " - " delimiter), the
+  // header surfaces an "Auto-detected" warning chip so a rename-attack
+  // filename can't silently misattribute authorship. High-confidence is
+  // the default — only the `false` case opts in.
+  const attributionHighConfidence = bookMetadata?.highConfidence ?? true;
 
   return (
     <div className="min-h-screen bg-paper text-ink">
@@ -611,6 +617,7 @@ export function StreamingClient(props: StreamingClientProps) {
       <TutorialHeader
         bookTitle={bookTitle}
         author={bookAuthor}
+        attributionHighConfidence={attributionHighConfidence}
         completionPct={completionPct}
         currentChapter={
           visibleChapter
@@ -703,6 +710,7 @@ export function StreamingClient(props: StreamingClientProps) {
                     <ChapterLessons
                       narrative={c.parsedNarrative}
                       sourceParagraphs={c.sourceParagraphs}
+                      isFirstChapter={c.ordinal === 0}
                       renderLastLessonExtras={() => {
                         // T2.6 gate: Mark Complete is blocked until the user
                         // has clicked "Check answers" on the chapter's quiz
