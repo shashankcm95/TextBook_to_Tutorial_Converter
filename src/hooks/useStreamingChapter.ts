@@ -66,8 +66,28 @@ export interface StreamFrame {
 }
 
 export interface UseStreamingChapterArgs {
-  /** The tutorial id. Stream URL is derived as `/api/tutorials/${id}/stream`. */
+  /**
+   * The tutorial id. Stream URL is derived per the per-chapter contract
+   * (DRIFT-test3-019): when `chapterIdx` is provided, URL is
+   * `/api/tutorials/${id}/chapters/${chapterIdx}/stream`. When omitted,
+   * URL falls back to the legacy tutorial-level
+   * `/api/tutorials/${id}/stream` route. The fallback exists so a parent
+   * can opt into the all-chapters-in-one-stream legacy behavior; new
+   * call sites (Commit 3 lazy-hybrid-chunking) should always pass
+   * `chapterIdx`.
+   */
   tutorialId: string;
+  /**
+   * The chapter ordinal to stream (0-indexed). When provided, the hook
+   * targets the per-chapter SSE endpoint. When the value CHANGES (e.g.,
+   * user marks current chapter complete → server bumps
+   * `max_unlocked_chapter_idx` → parent re-computes the active chapter →
+   * passes a new `chapterIdx`), the hook tears down the current stream
+   * and opens a fresh one for the new chapter. This is the load-bearing
+   * mechanism that removes the "need-clean-nav after Mark Complete" UX
+   * caveat.
+   */
+  chapterIdx?: number;
   /**
    * Called for every successfully parsed SSE frame. Caller routes by
    * `frame.event` (e.g., 'token' → append to current chapter; 'cost-update'
@@ -77,7 +97,9 @@ export interface UseStreamingChapterArgs {
   onFrame: (frame: StreamFrame) => void;
   /**
    * Optional: skip opening on mount. Useful if the parent wants to wait for
-   * some condition (e.g., user clicks "Start") before subscribing. Default false.
+   * some condition (e.g., user clicks "Start") before subscribing, or for
+   * the case where no chapter is currently active (all complete, or
+   * waiting on gating). Default false.
    */
   paused?: boolean;
 }
@@ -111,7 +133,7 @@ const MAX_RECONNECT_ATTEMPTS = RECONNECT_DELAYS_MS.length;
 export function useStreamingChapter(
   args: UseStreamingChapterArgs,
 ): UseStreamingChapterResult {
-  const { tutorialId, onFrame, paused = false } = args;
+  const { tutorialId, chapterIdx, onFrame, paused = false } = args;
 
   const [status, setStatus] = useState<StreamStatus>('idle');
   const [error, setError] = useState<Error | null>(null);
@@ -194,7 +216,14 @@ export function useStreamingChapter(
 
       setStatus(attempt === 0 ? 'connecting' : 'reconnecting');
 
-      const url = `/api/tutorials/${encodeURIComponent(tutorialId)}/stream`;
+      // Per-chapter URL when chapterIdx is provided (DRIFT-019); fall back to
+      // the legacy tutorial-level stream for call sites that haven't migrated
+      // (mainly the existing hook test, which exercises the cleanup contract
+      // and doesn't care which URL is hit).
+      const url =
+        typeof chapterIdx === 'number' && Number.isFinite(chapterIdx)
+          ? `/api/tutorials/${encodeURIComponent(tutorialId)}/chapters/${encodeURIComponent(String(chapterIdx))}/stream`
+          : `/api/tutorials/${encodeURIComponent(tutorialId)}/stream`;
       // EventSource doesn't accept AbortSignal directly (DOM spec gap), so
       // the AbortController is paired separately and propagated to the
       // server via the underlying TCP close when we call es.close() below.
@@ -355,8 +384,13 @@ export function useStreamingChapter(
     };
     // We deliberately omit `status` from deps — it would re-open on every
     // status transition. The hook owns its own lifecycle; status is output.
+    //
+    // `chapterIdx` IS in deps (DRIFT-019): when the parent recomputes the
+    // active chapter after Mark Complete, this effect tears down the old
+    // stream and opens a fresh one for the newly-active chapter — the whole
+    // point of the per-chapter rewire.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tutorialId, paused, teardown]);
+  }, [tutorialId, chapterIdx, paused, teardown]);
 
   return { status, error, cancel, reconnectCount };
 }

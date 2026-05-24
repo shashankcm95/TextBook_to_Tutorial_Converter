@@ -211,3 +211,56 @@ describe('useStreamingChapter — cleanup contract (riley CRITICAL-1)', () => {
     expect(() => unmount()).not.toThrow();
   });
 });
+
+// ───────────────────────────────────────────────────────────────────────────
+// DRIFT-test3-019 — per-chapter SSE rewire
+// ───────────────────────────────────────────────────────────────────────────
+//
+// When chapterIdx is provided, the hook targets the per-chapter route and
+// must re-open a fresh EventSource whenever chapterIdx changes — that is the
+// load-bearing mechanism that removes the "need-clean-nav after Mark
+// Complete" UX caveat. The parent recomputes the active chapter ordinal
+// after the ratchet bumps; the hook follows.
+
+describe('useStreamingChapter — per-chapter URL + re-open on chapterIdx change (DRIFT-019)', () => {
+  it('targets the per-chapter route when chapterIdx is provided', () => {
+    const onFrame = vi.fn();
+    renderHook(() =>
+      useStreamingChapter({ tutorialId: 'abc-tutorial', chapterIdx: 3, onFrame }),
+    );
+    expect(createdInstances).toHaveLength(1);
+    expect(createdInstances[0]?.__ctorUrl).toBe(
+      '/api/tutorials/abc-tutorial/chapters/3/stream',
+    );
+  });
+
+  it('tears down the old EventSource and opens a fresh one when chapterIdx changes', () => {
+    const onFrame = vi.fn();
+    const { rerender } = renderHook(
+      ({ chapterIdx }: { chapterIdx: number }) =>
+        useStreamingChapter({ tutorialId: 'abc-tutorial', chapterIdx, onFrame }),
+      { initialProps: { chapterIdx: 0 } },
+    );
+
+    // First mount opens stream for chapter 0.
+    expect(createdInstances).toHaveLength(1);
+    const first = createdInstances[0]!;
+    expect(first.__ctorUrl).toBe('/api/tutorials/abc-tutorial/chapters/0/stream');
+    expect(first.close).not.toHaveBeenCalled();
+
+    // Simulate the Mark-Complete + router.refresh() cycle: parent recomputes
+    // activeChapterIdx → passes a new chapterIdx → hook should switch streams.
+    rerender({ chapterIdx: 1 });
+
+    // First stream closed; second stream opened with the new URL.
+    expect(first.close).toHaveBeenCalledTimes(1);
+    expect(createdInstances).toHaveLength(2);
+    expect(createdInstances[1]?.__ctorUrl).toBe(
+      '/api/tutorials/abc-tutorial/chapters/1/stream',
+    );
+    // Each per-chapter open gets its own AbortController; the previous one
+    // should have been aborted by the teardown path so the server-side
+    // OpenAI fetch tied to chapter 0 stops generating tokens.
+    expect(abortSpies.some((s) => s.mock.calls.length > 0)).toBe(true);
+  });
+});
