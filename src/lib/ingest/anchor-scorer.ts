@@ -53,6 +53,32 @@ const MAX_COMPLETION_TOKENS = 2500;
 const TOP_N_CAP = 30;
 
 /**
+ * Maximum candidates passed to the LLM in a single call. When the input
+ * candidate list exceeds this, we split into batches and run them with
+ * bounded concurrency. Empirically: a 100-candidate batch renders to
+ * ~1500 prompt tokens, leaving ample headroom against gpt-4o-mini's 128K
+ * context AND keeping any one batch's output well under MAX_COMPLETION_TOKENS.
+ *
+ * Why batching (Wave 4): the Wave-3 smoke run extracted from a 300-paragraph
+ * stride sample because passing all 500+ candidates from a full DDIA-sized
+ * corpus into one LLM call produced rendering blowups (and would risk output
+ * truncation even when the prompt fit). Batching unblocks full-corpus
+ * extraction so the whitelist surfaces book-wide anchors (head-of-line
+ * blocking, t-digest, etc.) instead of just whatever lives in the sampled
+ * paragraphs.
+ */
+const BATCH_SIZE = 100;
+
+/**
+ * Bounded concurrency for batch fan-out. With BATCH_SIZE=100 and typical
+ * gpt-4o-mini latencies (~5-12s per call), 4 in-flight batches give us
+ * ~25-50s wall-clock for a 500-candidate book without overloading the
+ * caller's rate-limit budget (gpt-4o-mini's TPM is generous, but we share
+ * it with voice-extract, narrative streaming, and the fidelity scorer).
+ */
+const MAX_CONCURRENT_BATCHES = 4;
+
+/**
  * Final anchor categories the LLM is allowed to return. Order is significant:
  * lower index = higher priority for tie-break when two candidates share the
  * same frequency in the top-N selection step.
@@ -366,45 +392,32 @@ function stripGlossaryFlag(
 // ───────────────────────────────────────────────────────────────────────────
 
 /**
- * Score + categorize + cap an anchor-candidate list.
- *
- *  - Empty candidates → returns early with empty whitelist, no LLM call.
- *  - Otherwise: calls gpt-4o-mini with strict-mode JSON, drops LLM
- *    hallucinations + invalid categories, applies glossary-priority boost,
- *    caps to top-30 by (frequency desc, category priority, term alpha).
- *  - Wraps in withRetry (operationName 'anchor-scorer').
- *
- * Does NOT write to S3. The caller (worker.ts) handles persistence.
+ * Per-batch result. Internal to the batched scorer; not exported.
  */
-export async function scoreAnchorCandidates(
-  args: ScoreAnchorCandidatesArgs,
-): Promise<ScoreAnchorCandidatesResult> {
-  const { candidates, abortSignal } = args;
+interface BatchResult {
+  /** Accepted entries from this batch (pre-glossary-boost, pre-cap). */
+  accepted: Array<AnchorWhitelistEntry & { isGlossary: boolean }>;
+  promptTokens: number;
+  completionTokens: number;
+}
 
-  if (!isSupportedModel(MODEL)) throw new UnknownModelError(MODEL);
-
-  // Early return: nothing to score. No LLM call, zero cost.
-  if (candidates.length === 0) {
-    return {
-      whitelist: [],
-      candidateCount: 0,
-      acceptedCount: 0,
-      extractionCostUsd: 0,
-      model: MODEL,
-      promptTokens: 0,
-      completionTokens: 0,
-    };
-  }
-
-  // Lookup table for hallucination guard: lowercase term → original candidate.
-  // Lowercase because the LLM may echo casing inconsistently; the candidate
-  // term carries the authoritative verbatim casing.
-  const byLowerTerm = new Map<string, AnchorCandidate>();
-  for (const c of candidates) {
-    byLowerTerm.set(c.term.toLowerCase(), c);
-  }
-
-  const userPrompt = buildScorerUserPrompt(candidates);
+/**
+ * Score ONE batch of candidates against the LLM. Pure compute: same
+ * hallucination + category guards as the single-call path, but returns
+ * the accepted list raw (no glossary boost, no top-N cap — those happen
+ * once at the end, over the union of all batches).
+ *
+ * The `byLowerTerm` map is the FULL candidate lookup (shared across
+ * batches) so the hallucination guard still works even though the LLM
+ * only saw a slice in this call.
+ */
+async function scoreOneBatch(args: {
+  batchCandidates: AnchorCandidate[];
+  byLowerTerm: Map<string, AnchorCandidate>;
+  abortSignal?: AbortSignal;
+}): Promise<BatchResult> {
+  const { batchCandidates, byLowerTerm, abortSignal } = args;
+  const userPrompt = buildScorerUserPrompt(batchCandidates);
 
   return withRetry({
     operationName: 'anchor-scorer',
@@ -414,11 +427,7 @@ export async function scoreAnchorCandidates(
       // Wave-2 review HIGH 2A-H2 fix: honor `withRetry`'s attempt index.
       // On a parse-retry (attempt > 0), append a stricter JSON-only
       // reminder so the second attempt has a different prompt than the
-      // first. Strict-mode schema already enforces shape at the API
-      // boundary, but the reminder gives the model a more emphatic
-      // instruction for the rare cases where the schema validation
-      // path fails (e.g., the model emitted text outside the JSON
-      // block). Mirrors the legacy streaming.ts pattern (test3 Phase 3).
+      // first.
       const effectiveUserPrompt =
         attempt > 0
           ? `${userPrompt}\n\n[RETRY NOTE: the previous attempt produced output that did not conform to the response schema. Emit ONLY valid JSON matching the schema; no prose, no markdown fence, no \`keep: false\` entries.]`
@@ -459,10 +468,8 @@ export async function scoreAnchorCandidates(
         );
       }
 
-      // Build accepted entries with defensive guards:
-      //   - Drop hallucinated terms (not in input candidates).
-      //   - Drop invalid categories.
-      //   - De-dup on lowercase term (LLM may echo the same term twice).
+      // Per-batch accepted list (with defensive guards). Cross-batch
+      // de-dup happens at the aggregation step.
       const acceptedKeys = new Set<string>();
       const accepted: Array<AnchorWhitelistEntry & { isGlossary: boolean }> = [];
       for (const a of parsed.anchors) {
@@ -472,7 +479,7 @@ export async function scoreAnchorCandidates(
         if (!VALID_CATEGORIES.has(a.category as AnchorWhitelistEntry['category'])) {
           continue;
         }
-        if (acceptedKeys.has(key)) continue; // de-dup
+        if (acceptedKeys.has(key)) continue; // de-dup within batch
         acceptedKeys.add(key);
         accepted.push({
           term: candidate.term, // verbatim from candidate, not LLM echo
@@ -483,65 +490,166 @@ export async function scoreAnchorCandidates(
         });
       }
 
-      // Glossary-priority boost (§D8): glossary candidates that were
-      // REJECTED by the LLM (not in `accepted`) but have non-zero frequency
-      // should still get a shot at the top-30. We assign them the
-      // 'search-term' fallback category — they're canonical author intent
-      // and the LLM rejecting them is often a false-negative (e.g., the
-      // glossary defines an acronym the LLM didn't recognize as load-bearing).
-      //
-      // This is the "auto-survive" branch of the spec: glossary-sourced
-      // candidates ride into the top-30 even when the LLM said no.
-      //
-      // Wave-2 review HIGH 2A-H1 fix: zero-frequency guard. The anchor
-      // validator's contract is "if a whitelist anchor appears in the
-      // chunk's source paragraphs, the narrative must contain it
-      // verbatim." A glossary term that the author defined but NEVER
-      // used in any body paragraph (frequency === 0) cannot satisfy
-      // the validator's "appears in source" precondition, so adding it
-      // to the whitelist is dead weight at best (no signal for the
-      // narrative prompt; no validation can fire). At worst it bloats
-      // the prompt + crowds out real anchors. The spec's "canonical
-      // author intent" rationale only holds when the author actually
-      // USED the term — defining it in a glossary entry but never
-      // referring to it is the case where authorial intent diverges
-      // from authorial practice; we follow practice for the validator's
-      // sake.
-      for (const c of candidates) {
-        if (c.glossary_priority !== true) continue;
-        if (c.frequency <= 0) continue; // Wave-2 review HIGH 2A-H1
-        const key = c.term.toLowerCase();
-        if (acceptedKeys.has(key)) continue;
-        acceptedKeys.add(key);
-        accepted.push({
-          term: c.term,
-          category: 'search-term',
-          frequency_in_source: c.frequency,
-          first_seen_at: c.first_seen_at,
-          isGlossary: true,
-        });
-      }
-
-      // Cap to top-30 with glossary-priority boost.
-      const whitelist = selectTopNWithGlossaryBoost(accepted);
-
-      const costUsd = actualCost({
-        model: MODEL,
-        promptTokens,
-        completionTokens,
-      });
-
-      return {
-        whitelist,
-        candidateCount: candidates.length,
-        acceptedCount: whitelist.length,
-        extractionCostUsd: costUsd,
-        model: MODEL,
-        promptTokens,
-        completionTokens,
-      };
+      return { accepted, promptTokens, completionTokens };
     },
   });
+}
+
+/**
+ * Run an array of async batch tasks with bounded concurrency. Simpler than
+ * pulling in p-limit; just slices into chunks and Promise.all's each chunk.
+ * Order of results matches order of tasks (since we await each chunk before
+ * starting the next, and Promise.all preserves order). This matters for
+ * cost-row determinism — telemetry is easier to grep when batches run in a
+ * predictable order.
+ */
+async function runWithConcurrency<T>(
+  tasks: Array<() => Promise<T>>,
+  concurrency: number,
+): Promise<T[]> {
+  const results: T[] = [];
+  for (let i = 0; i < tasks.length; i += concurrency) {
+    const slice = tasks.slice(i, i + concurrency);
+    const sliceResults = await Promise.all(slice.map((t) => t()));
+    results.push(...sliceResults);
+  }
+  return results;
+}
+
+/**
+ * Score + categorize + cap an anchor-candidate list.
+ *
+ *  - Empty candidates → returns early with empty whitelist, no LLM call.
+ *  - ≤ BATCH_SIZE candidates → single LLM call (same behavior as Wave 2/3).
+ *  - > BATCH_SIZE candidates → split into batches of BATCH_SIZE, run with
+ *    bounded concurrency (MAX_CONCURRENT_BATCHES), then aggregate.
+ *  - Each batch's LLM call is wrapped in withRetry (operationName
+ *    'anchor-scorer'). A failure in any batch propagates out (fail-fast):
+ *    the worker's outer try/catch handles fail-open.
+ *  - Glossary-priority boost + top-30 cap happen ONCE at the end, over
+ *    the union of accepted entries from all batches.
+ *
+ * Wave 4 — Candidate batching: with full-corpus extraction (no upstream
+ * cap), DDIA-scale books produce 500+ candidates. A single call would
+ * either render to a 30K+ prompt or risk completion-token truncation.
+ * Batching keeps any one call's input + output bounded, and the
+ * aggregation logic is invariant under batch boundaries: the same union
+ * of accepted entries fed to the same top-30-selector yields the same
+ * whitelist regardless of how the candidates were sliced.
+ *
+ * Does NOT write to S3. The caller (worker.ts) handles persistence.
+ */
+export async function scoreAnchorCandidates(
+  args: ScoreAnchorCandidatesArgs,
+): Promise<ScoreAnchorCandidatesResult> {
+  const { candidates, abortSignal } = args;
+
+  if (!isSupportedModel(MODEL)) throw new UnknownModelError(MODEL);
+
+  // Early return: nothing to score. No LLM call, zero cost.
+  if (candidates.length === 0) {
+    return {
+      whitelist: [],
+      candidateCount: 0,
+      acceptedCount: 0,
+      extractionCostUsd: 0,
+      model: MODEL,
+      promptTokens: 0,
+      completionTokens: 0,
+    };
+  }
+
+  // Lookup table for hallucination guard: lowercase term → original candidate.
+  // Built ONCE from the full candidate list and shared across all batches —
+  // an LLM in batch K should never echo a term outside its slice, but the
+  // shared map is the right contract (defensive + future-proof against e.g.
+  // overlapping windowed batches).
+  const byLowerTerm = new Map<string, AnchorCandidate>();
+  for (const c of candidates) {
+    byLowerTerm.set(c.term.toLowerCase(), c);
+  }
+
+  // Split candidates into batches preserving sort order. Pre-filter sorted
+  // by frequency desc, so batch 0 = highest-frequency anchors, batch K =
+  // lowest. This matters if the LLM is "lazier" on the last batch: a
+  // truncation there is less costly than a truncation in batch 0.
+  const batches: AnchorCandidate[][] = [];
+  for (let i = 0; i < candidates.length; i += BATCH_SIZE) {
+    batches.push(candidates.slice(i, i + BATCH_SIZE));
+  }
+
+  // Build batch tasks + execute with bounded concurrency.
+  const batchTasks = batches.map(
+    (batch) => () =>
+      scoreOneBatch({
+        batchCandidates: batch,
+        byLowerTerm,
+        abortSignal,
+      }),
+  );
+  const batchResults = await runWithConcurrency(batchTasks, MAX_CONCURRENT_BATCHES);
+
+  // Aggregate: merge accepted entries (cross-batch de-dup by lowercase term),
+  // sum prompt + completion tokens.
+  const mergedKeys = new Set<string>();
+  const merged: Array<AnchorWhitelistEntry & { isGlossary: boolean }> = [];
+  let totalPromptTokens = 0;
+  let totalCompletionTokens = 0;
+  for (const br of batchResults) {
+    totalPromptTokens += br.promptTokens;
+    totalCompletionTokens += br.completionTokens;
+    for (const entry of br.accepted) {
+      const key = entry.term.toLowerCase();
+      if (mergedKeys.has(key)) continue;
+      mergedKeys.add(key);
+      merged.push(entry);
+    }
+  }
+
+  // Glossary-priority boost (§D8): glossary candidates that were
+  // REJECTED by the LLM (not in `merged`) but have non-zero frequency
+  // should still get a shot at the top-30. We assign them the
+  // 'search-term' fallback category — they're canonical author intent
+  // and the LLM rejecting them is often a false-negative.
+  //
+  // Wave-2 review HIGH 2A-H1 fix: zero-frequency guard. A glossary term
+  // the author defined but NEVER used in any body paragraph (frequency
+  // === 0) cannot satisfy the validator's "appears in source"
+  // precondition, so adding it to the whitelist is dead weight.
+  for (const c of candidates) {
+    if (c.glossary_priority !== true) continue;
+    if (c.frequency <= 0) continue; // Wave-2 review HIGH 2A-H1
+    const key = c.term.toLowerCase();
+    if (mergedKeys.has(key)) continue;
+    mergedKeys.add(key);
+    merged.push({
+      term: c.term,
+      category: 'search-term',
+      frequency_in_source: c.frequency,
+      first_seen_at: c.first_seen_at,
+      isGlossary: true,
+    });
+  }
+
+  // Cap to top-30 with glossary-priority boost. This is the single point
+  // at which the cap is applied — independent of batch count.
+  const whitelist = selectTopNWithGlossaryBoost(merged);
+
+  const costUsd = actualCost({
+    model: MODEL,
+    promptTokens: totalPromptTokens,
+    completionTokens: totalCompletionTokens,
+  });
+
+  return {
+    whitelist,
+    candidateCount: candidates.length,
+    acceptedCount: whitelist.length,
+    extractionCostUsd: costUsd,
+    model: MODEL,
+    promptTokens: totalPromptTokens,
+    completionTokens: totalCompletionTokens,
+  };
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -553,6 +661,8 @@ export const __TEST_ONLY = {
   MODEL,
   MAX_COMPLETION_TOKENS,
   TOP_N_CAP,
+  BATCH_SIZE,
+  MAX_CONCURRENT_BATCHES,
   SYSTEM_PROMPT,
   ANCHOR_SCORER_RESPONSE_FORMAT,
   CATEGORY_PRIORITY,

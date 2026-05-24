@@ -638,6 +638,193 @@ describe('scoreAnchorCandidates', () => {
     expect(result.whitelist[0]?.term).toBe('Chaos Monkey');
   });
 
+  // ─────────────────────────────────────────────────────────────────────
+  // Wave 4 — Candidate batching
+  // ─────────────────────────────────────────────────────────────────────
+
+  it('Wave 4: splits >BATCH_SIZE candidates into batches (250 → 3 calls)', async () => {
+    // BATCH_SIZE = 100; 250 candidates → 3 batches (100 + 100 + 50).
+    const candidates = makeNCandidates(250, 250);
+    const batchAccepted = [
+      candidates.slice(0, 100),
+      candidates.slice(100, 200),
+      candidates.slice(200, 250),
+    ];
+    // Each batch echoes back its slice as accepted. Tokens vary per batch
+    // so we can assert summing later.
+    createMock
+      .mockResolvedValueOnce(
+        buildOpenAIResponse(buildLLMContentFromCandidates(batchAccepted[0]!), 1500, 600),
+      )
+      .mockResolvedValueOnce(
+        buildOpenAIResponse(buildLLMContentFromCandidates(batchAccepted[1]!), 1500, 600),
+      )
+      .mockResolvedValueOnce(
+        buildOpenAIResponse(buildLLMContentFromCandidates(batchAccepted[2]!), 800, 300),
+      );
+
+    const result = await scoreAnchorCandidates({
+      pdfSha256: 'sha-batch-250',
+      candidates,
+    });
+
+    expect(createMock).toHaveBeenCalledTimes(3);
+    expect(result.candidateCount).toBe(250);
+    // Top-30 cap still applies over the union of all batches.
+    expect(result.whitelist.length).toBe(30);
+    // Tokens summed across batches: 1500+1500+800 prompt, 600+600+300 completion.
+    expect(result.promptTokens).toBe(3800);
+    expect(result.completionTokens).toBe(1500);
+    // Cost summed too: 3800 × 0.15/1M + 1500 × 0.60/1M = 0.00057 + 0.0009 = 0.00147
+    expect(result.extractionCostUsd).toBeCloseTo(0.00147, 6);
+    // Top-30 should be the highest-frequency candidates regardless of batch
+    // boundaries: term-0..term-29 (frequencies 250..221).
+    expect(result.whitelist[0]?.term).toBe('term-0');
+    expect(result.whitelist[0]?.frequency_in_source).toBe(250);
+  });
+
+  it('Wave 4: ≤BATCH_SIZE candidates uses single batch (no behavior change)', async () => {
+    // 100 candidates → exactly 1 batch. Asserts the existing single-call
+    // contract is preserved for small inputs.
+    const candidates = makeNCandidates(100, 200);
+    createMock.mockResolvedValueOnce(
+      buildOpenAIResponse(buildLLMContentFromCandidates(candidates)),
+    );
+
+    const result = await scoreAnchorCandidates({
+      pdfSha256: 'sha-batch-100',
+      candidates,
+    });
+
+    expect(createMock).toHaveBeenCalledTimes(1);
+    expect(result.whitelist.length).toBe(30);
+  });
+
+  it('Wave 4: cross-batch de-dup (term appearing in two batches counted once)', async () => {
+    // 150 candidates split across 2 batches. We arrange the LLM to echo
+    // "term-0" (a real candidate) back in BOTH batches' accepted lists.
+    // This shouldn't normally happen — each batch only sees its slice —
+    // but the de-dup guard is contract; we exercise it explicitly.
+    const candidates = makeNCandidates(150, 150);
+    // Batch 0 echoes back its slice (incl. term-0).
+    const batch0Response = buildLLMContentFromCandidates(candidates.slice(0, 100));
+    // Batch 1: doctored to ALSO echo term-0 (simulating an LLM hallucination
+    // outside its slice — the hallucination guard would normally drop it,
+    // BUT term-0 is a real candidate so it survives the guard).
+    const batch1WithDup = JSON.stringify({
+      anchors: [
+        ...candidates.slice(100).map((c) => ({
+          term: c.term,
+          category: 'search-term' as const,
+          keep: true,
+        })),
+        { term: 'term-0', category: 'named-system' as const, keep: true }, // dup!
+      ],
+    });
+    createMock
+      .mockResolvedValueOnce(buildOpenAIResponse(batch0Response))
+      .mockResolvedValueOnce(buildOpenAIResponse(batch1WithDup));
+
+    const result = await scoreAnchorCandidates({
+      pdfSha256: 'sha-cross-batch-dup',
+      candidates,
+    });
+
+    expect(createMock).toHaveBeenCalledTimes(2);
+    // term-0 appears exactly once.
+    const termZeroOccurrences = result.whitelist.filter((e) => e.term === 'term-0');
+    expect(termZeroOccurrences.length).toBe(1);
+    // First-batch-wins: term-0 keeps its 'search-term' category, not 'named-system'.
+    expect(termZeroOccurrences[0]?.category).toBe('search-term');
+  });
+
+  it('Wave 4: glossary boost applies after merging batches (not per-batch)', async () => {
+    // 150 candidates: 149 non-glossary + 1 glossary in the LAST position.
+    // With BATCH_SIZE=100, the glossary candidate lands in batch-1 (the
+    // second batch). The LLM rejects it in batch-1. The post-aggregation
+    // glossary-boost step should still promote it into the top-30.
+    const nonGlossary = Array.from({ length: 149 }, (_, i) =>
+      makeCandidate({
+        term: `ng-${i}`,
+        frequency: 200 - i, // 200..52
+        firstSeen: `page${i + 1}:paragraph0`,
+      }),
+    );
+    const glossary = makeCandidate({
+      term: 'BOOSTED_GLOSSARY',
+      frequency: 1,
+      source: 'glossary',
+      firstSeen: 'page150:paragraph0',
+      glossary: true,
+    });
+    const candidates = [...nonGlossary, glossary];
+
+    // Batch 0 accepts its 100 non-glossary terms; batch 1 accepts ONLY
+    // its 49 non-glossary terms (rejects the glossary candidate).
+    const batch0 = buildLLMContentFromCandidates(candidates.slice(0, 100));
+    const batch1 = buildLLMContentFromCandidates(candidates.slice(100, 149));
+    createMock
+      .mockResolvedValueOnce(buildOpenAIResponse(batch0))
+      .mockResolvedValueOnce(buildOpenAIResponse(batch1));
+
+    const result = await scoreAnchorCandidates({
+      pdfSha256: 'sha-batch-glossary',
+      candidates,
+    });
+
+    expect(createMock).toHaveBeenCalledTimes(2);
+    // Glossary entry survives the top-30 cap.
+    expect(result.whitelist.find((e) => e.term === 'BOOSTED_GLOSSARY')).toBeDefined();
+    expect(result.whitelist.length).toBe(30);
+  });
+
+  it('Wave 4: bounded concurrency caps in-flight batches at MAX_CONCURRENT_BATCHES', async () => {
+    // 600 candidates → 6 batches. MAX_CONCURRENT_BATCHES = 4, so the
+    // runner must process them in chunks: 4-then-2 (or 4-then-4 etc.,
+    // depending on implementation). We assert by counting how many
+    // requests are "in-flight" at peak via a shared counter.
+    const candidates = makeNCandidates(600, 600);
+    let inFlight = 0;
+    let peakInFlight = 0;
+
+    createMock.mockImplementation(async () => {
+      inFlight += 1;
+      if (inFlight > peakInFlight) peakInFlight = inFlight;
+      // Give the scheduler enough microtasks to actually overlap.
+      await new Promise((r) => setTimeout(r, 5));
+      inFlight -= 1;
+      return buildOpenAIResponse(JSON.stringify({ anchors: [] }));
+    });
+
+    await scoreAnchorCandidates({
+      pdfSha256: 'sha-concurrency',
+      candidates,
+    });
+
+    expect(createMock).toHaveBeenCalledTimes(6);
+    expect(peakInFlight).toBeLessThanOrEqual(__TEST_ONLY.MAX_CONCURRENT_BATCHES);
+    // Sanity: we should actually be using concurrency, not running serial.
+    expect(peakInFlight).toBeGreaterThan(1);
+  });
+
+  it('Wave 4: batch failure propagates (fail-fast over fail-open)', async () => {
+    // First batch fails its full retry budget (7 calls of bad shape);
+    // remaining batches should not need to succeed — the failure should
+    // surface to the caller. (worker.ts wraps the whole call in its own
+    // try/catch for fail-open.)
+    const candidates = makeNCandidates(150, 150);
+    createMock.mockResolvedValue(
+      buildOpenAIResponse(JSON.stringify({ unrelated: 'object' })),
+    );
+
+    await expect(
+      scoreAnchorCandidates({
+        pdfSha256: 'sha-batch-fail',
+        candidates,
+      }),
+    ).rejects.toBeInstanceOf(AnchorScorerParseError);
+  });
+
   it('de-duplicates if LLM returns the same term twice', async () => {
     const candidates = [makeCandidate({ term: 'unique', frequency: 5 })];
     const content = JSON.stringify({
