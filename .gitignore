@@ -42,3 +42,7 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
+
+# Eval harness run artifacts (per docs/eval/HARNESS-DESIGN.md §D4)
+_ab-runs/
+_ux-walks/
