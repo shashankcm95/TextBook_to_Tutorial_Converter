@@ -101,22 +101,20 @@ async function main() {
     process.exit(1);
   }
 
-  // Cap input size for the smoke run: a 613-page book like DDIA has ~5000
-  // body paragraphs which (a) overshoots the voice extractor's 10-sample
-  // window pointlessly and (b) blows the anchor scorer's 128K context
-  // window on candidate count. For the smoke we sample evenly across the
-  // body so voice + anchors remain representative.
-  const MAX_BODY_PARAGRAPHS_FOR_EXTRACTION = 300;
-  let sampledParagraphs = bodyParagraphs;
-  if (bodyParagraphs.length > MAX_BODY_PARAGRAPHS_FOR_EXTRACTION) {
-    const stride = Math.floor(bodyParagraphs.length / MAX_BODY_PARAGRAPHS_FOR_EXTRACTION);
-    sampledParagraphs = [];
-    for (let i = 0; i < bodyParagraphs.length && sampledParagraphs.length < MAX_BODY_PARAGRAPHS_FOR_EXTRACTION; i += stride) {
-      const p = bodyParagraphs[i];
-      if (p) sampledParagraphs.push(p);
-    }
-    console.log(`sampled to ${sampledParagraphs.length} paragraphs (stride=${stride})`);
-  }
+  // Wave 4: pass the full body to both extractors. The Wave-3 smoke had to
+  // stride-sample down to 300 paragraphs because (a) the LLM scorer
+  // couldn't handle a full-corpus candidate list in one call (now solved
+  // by Wave 4 batching: BATCH_SIZE=100, bounded concurrency=4), and
+  // (b) the voice extractor's sampling window is internal — sub-sampling
+  // upstream just degraded its representative pick.
+  //
+  // The pre-filter itself is pure + deterministic + scales linearly in
+  // paragraph count; empirically it handles 12K DDIA paragraphs without
+  // trouble. Voice extractor self-samples to 10 paragraphs internally, so
+  // passing the full body lets ITS sampling pick the best representatives
+  // rather than us hobbling it.
+  const sampledParagraphs = bodyParagraphs;
+  console.log(`passing full body (${sampledParagraphs.length} paragraphs) to extractors`);
 
   // Pull glossary for anchor pre-filter input (optional — anchor-prefilter
   // works without it; glossary just adds priority candidates).
@@ -134,16 +132,10 @@ async function main() {
         glossaryTerms: glossaryTermStrings,
       });
       console.log(`anchor candidates: ${candidates.length}`);
-      // Cap candidates handed to the LLM scorer; the scorer itself reads up
-      // to MAX (its internal default) but DDIA can produce 500+ candidates.
-      // Top-100 by frequency (the candidates are already sorted desc) keeps
-      // the scorer prompt under ~30K tokens.
-      const MAX_CANDIDATES_FOR_LLM = 100;
-      const cappedCandidates = candidates.slice(0, MAX_CANDIDATES_FOR_LLM);
-      if (cappedCandidates.length < candidates.length) {
-        console.log(`capped to ${cappedCandidates.length} (top by frequency) for LLM scoring`);
-      }
-      return scoreAnchorCandidates({ pdfSha256: sha256, candidates: cappedCandidates });
+      // Wave 4: pass ALL candidates (no cap). The scorer batches internally
+      // at BATCH_SIZE=100 with MAX_CONCURRENT_BATCHES=4; a 500-candidate
+      // book runs as 5 batches in ~25-50s wall-clock.
+      return scoreAnchorCandidates({ pdfSha256: sha256, candidates });
     })(),
   ]);
 
