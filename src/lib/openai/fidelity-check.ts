@@ -18,10 +18,35 @@
 import { openai } from './client';
 import { actualCost } from './cost';
 import { withRetry } from './_retry';
+import { containsAnchor, type AnchorWhitelistEntry } from './anchor-validator';
 import type { SourceParagraph } from '@/lib/types';
 
 const MODEL = 'gpt-4o-mini';
 const MAX_COMPLETION_TOKENS = 1200;
+
+// ─── Anchor-aware prompt addendum (Wave 3C / Feature B' Component 5) ───────
+//
+// When the scorer is invoked WITH a non-empty anchor whitelist AND there is
+// at least one chunk-relevant anchor (i.e. a whitelist anchor that actually
+// appears in this chunk's source paragraphs), we append a deterministic
+// instruction block to the system prompt asking the LLM to count preserved
+// vs missing whitelist anchors. The list of relevant anchors is injected
+// into the USER prompt (because it is per-chunk data, not per-call policy).
+//
+// The two new response fields are required ONLY when this addendum is
+// active — when no whitelist (or no chunk-relevant anchors) is in play, the
+// scorer's prompt + response schema are byte-for-byte unchanged from the
+// pre-Wave-3 path, and the result's whitelist counts are null.
+const ANCHOR_AWARE_SYSTEM_SUFFIX = `
+
+WHITELIST ANCHORS (Wave 3 / Feature B'):
+You will also receive a section in the user message titled "WHITELIST ANCHORS PRESENT IN THIS CHUNK'S SOURCE" listing curated load-bearing terms that the editor pre-extracted from the SOURCE. These terms MUST appear verbatim in any faithful narrative.
+
+For each whitelist anchor in that list, check whether it appears VERBATIM (case-insensitive, whole-token) in the NARRATIVE. Then emit two additional integer fields in your JSON response:
+  - "whitelist_anchors_preserved": count of whitelist terms found in the narrative.
+  - "whitelist_anchors_missing":   count of whitelist terms absent from the narrative.
+
+These two counts must sum to the total number of whitelist anchors you were given.`;
 
 const SYSTEM_PROMPT = `You score how faithfully a tutorial narrative preserves the load-bearing concrete anchors from its source text. The narrative was AI-generated FROM the source; your job is to detect compression-induced loss.
 
@@ -62,6 +87,32 @@ Output strict JSON:
   "notes": [<short string>, ...]  // 3-5 brief notes naming specific dropped items
 }`;
 
+const BASE_PROPERTIES = {
+  specific_numbers_preserved: { type: 'integer', minimum: 0 },
+  named_examples_preserved: { type: 'integer', minimum: 0 },
+  terminological_contrasts_preserved: { type: 'integer', minimum: 0 },
+  specific_numbers_missing: { type: 'integer', minimum: 0 },
+  named_examples_missing: { type: 'integer', minimum: 0 },
+  terminological_contrasts_missing: { type: 'integer', minimum: 0 },
+  overall_score: { type: 'integer', minimum: 0, maximum: 100 },
+  notes: {
+    type: 'array',
+    items: { type: 'string' },
+    maxItems: 8,
+  },
+} as const;
+
+const BASE_REQUIRED = [
+  'specific_numbers_preserved',
+  'named_examples_preserved',
+  'terminological_contrasts_preserved',
+  'specific_numbers_missing',
+  'named_examples_missing',
+  'terminological_contrasts_missing',
+  'overall_score',
+  'notes',
+] as const;
+
 const RESPONSE_FORMAT = {
   type: 'json_schema' as const,
   json_schema: {
@@ -70,29 +121,36 @@ const RESPONSE_FORMAT = {
     schema: {
       type: 'object',
       additionalProperties: false,
+      required: [...BASE_REQUIRED],
+      properties: { ...BASE_PROPERTIES },
+    },
+  },
+} as const;
+
+/**
+ * Anchor-aware variant of the response schema (Wave 3C). Adds the two
+ * whitelist-anchor count fields to `required` and `properties`. Used only
+ * when scoreFidelity() is called with a non-empty, chunk-relevant
+ * anchorWhitelist; otherwise the base schema is used so the pre-Feature-B'
+ * code path is byte-for-byte preserved.
+ */
+const RESPONSE_FORMAT_WITH_ANCHORS = {
+  type: 'json_schema' as const,
+  json_schema: {
+    name: 'fidelity_score_with_anchors',
+    strict: true,
+    schema: {
+      type: 'object',
+      additionalProperties: false,
       required: [
-        'specific_numbers_preserved',
-        'named_examples_preserved',
-        'terminological_contrasts_preserved',
-        'specific_numbers_missing',
-        'named_examples_missing',
-        'terminological_contrasts_missing',
-        'overall_score',
-        'notes',
+        ...BASE_REQUIRED,
+        'whitelist_anchors_preserved',
+        'whitelist_anchors_missing',
       ],
       properties: {
-        specific_numbers_preserved: { type: 'integer', minimum: 0 },
-        named_examples_preserved: { type: 'integer', minimum: 0 },
-        terminological_contrasts_preserved: { type: 'integer', minimum: 0 },
-        specific_numbers_missing: { type: 'integer', minimum: 0 },
-        named_examples_missing: { type: 'integer', minimum: 0 },
-        terminological_contrasts_missing: { type: 'integer', minimum: 0 },
-        overall_score: { type: 'integer', minimum: 0, maximum: 100 },
-        notes: {
-          type: 'array',
-          items: { type: 'string' },
-          maxItems: 8,
-        },
+        ...BASE_PROPERTIES,
+        whitelist_anchors_preserved: { type: 'integer', minimum: 0 },
+        whitelist_anchors_missing: { type: 'integer', minimum: 0 },
       },
     },
   },
@@ -103,6 +161,17 @@ export interface FidelityCheckArgs {
   narrative: string;
   sourceParagraphs: SourceParagraph[];
   abortSignal?: AbortSignal;
+  /** NEW (Wave 3C / Feature B' Component 5): optional anchor whitelist.
+   *  When provided AND non-empty AND at least one whitelist anchor actually
+   *  appears in `sourceParagraphs`, the scorer becomes anchor-aware: it
+   *  injects the chunk-relevant whitelist slice into the prompt and asks
+   *  the LLM to deterministically count preserved vs missing anchors
+   *  (rather than re-discovering anchors per call).
+   *
+   *  When omitted, empty, or no whitelist anchor appears in the source,
+   *  the scorer's prompt + response schema are byte-for-byte unchanged
+   *  from the pre-Wave-3 path, and the two new result fields are null. */
+  anchorWhitelist?: AnchorWhitelistEntry[];
 }
 
 export interface FidelityCheckResult {
@@ -114,6 +183,13 @@ export interface FidelityCheckResult {
   terminologicalContrastsMissing: number;
   overallScore: number;     // 0-100
   notes: string[];
+  /** NEW (Wave 3C): count of whitelist anchors PRESERVED in the narrative.
+   *  Null when no anchorWhitelist was supplied, the whitelist was empty,
+   *  or no whitelist anchor was present in this chunk's source. */
+  whitelistAnchorsPreserved: number | null;
+  /** NEW (Wave 3C): count of whitelist anchors MISSING from the narrative.
+   *  Null under the same conditions as whitelistAnchorsPreserved. */
+  whitelistAnchorsMissing: number | null;
   promptTokens: number;
   completionTokens: number;
   costUsd: number;
@@ -134,7 +210,31 @@ export class FidelityCheckError extends Error {
  * is treated as "unknown fidelity" rather than blocking the read path.
  */
 export async function scoreFidelity(args: FidelityCheckArgs): Promise<FidelityCheckResult> {
-  const { chapterTitle, narrative, sourceParagraphs, abortSignal } = args;
+  const { chapterTitle, narrative, sourceParagraphs, abortSignal, anchorWhitelist } = args;
+
+  // ─── Wave 3C: chunk-relevant anchor filter ─────────────────────────────
+  // Of the supplied whitelist (if any), keep only anchors that actually
+  // appear in THIS chunk's source paragraphs. The LLM can only fairly be
+  // asked to preserve anchors the source actually contained. An empty
+  // whitelist OR no source-side hits collapses to the pre-Wave-3 path
+  // (prompt + schema byte-for-byte preserved, result fields null).
+  //
+  // Wave-3 review HIGH 3C-H2 fix: defensive cap on whitelist injection.
+  // Upstream (Wave 2A's scorer) caps the whitelist at 30, but this module
+  // is the last point before the prompt hits the LLM, so it enforces its
+  // own ceiling rather than trusting the upstream contract. With 30
+  // chunk-relevant entries at ~20 tokens each, the section is ~600 input
+  // tokens — below the noise floor.
+  const MAX_FIDELITY_WHITELIST_ENTRIES = 30;
+  const chunkRelevantAnchors: AnchorWhitelistEntry[] =
+    anchorWhitelist && anchorWhitelist.length > 0
+      ? anchorWhitelist
+          .filter((anchor) =>
+            sourceParagraphs.some((p) => containsAnchor(p.text, anchor.term)),
+          )
+          .slice(0, MAX_FIDELITY_WHITELIST_ENTRIES)
+      : [];
+  const isAnchorAware = chunkRelevantAnchors.length > 0;
 
   // Compact source for the comparison call — include only the indexed text,
   // capped to keep token budget bounded.
@@ -144,7 +244,10 @@ export async function scoreFidelity(args: FidelityCheckArgs): Promise<FidelityCh
   // Hard cap at ~30K chars to stay under per-request TPM for 4o-mini.
   const capped = sourceText.length > 30000 ? sourceText.slice(0, 30000) + '\n…[truncated]' : sourceText;
 
-  const userPrompt = [
+  // Build the user prompt. When anchor-aware, insert the chunk-relevant
+  // whitelist section between SOURCE and the final instruction; when NOT,
+  // the prompt is byte-for-byte identical to the pre-Wave-3 version.
+  const userPromptSections: string[] = [
     `SECTION TITLE: ${chapterTitle}`,
     '',
     'NARRATIVE (what the tutorial generated):',
@@ -153,8 +256,29 @@ export async function scoreFidelity(args: FidelityCheckArgs): Promise<FidelityCh
     'SOURCE PARAGRAPHS (what it was based on):',
     capped,
     '',
-    'Score the fidelity now.',
-  ].join('\n');
+  ];
+
+  if (isAnchorAware) {
+    const anchorList = chunkRelevantAnchors
+      .map((a) => `  - "${a.term}" (${a.category})`)
+      .join('\n');
+    userPromptSections.push(
+      "WHITELIST ANCHORS PRESENT IN THIS CHUNK'S SOURCE (these MUST appear verbatim in a faithful narrative):",
+      anchorList,
+      '',
+      'For each whitelist anchor above, check if it appears VERBATIM in the NARRATIVE. Count preserved and missing. The two counts MUST sum to the total number of whitelist anchors listed above.',
+      '',
+    );
+  }
+
+  userPromptSections.push('Score the fidelity now.');
+  const userPrompt = userPromptSections.join('\n');
+
+  // System prompt + response schema swap depending on anchor-aware mode.
+  // Pre-Wave-3 path (no whitelist or no chunk-relevant anchors) sees both
+  // unchanged byte-for-byte.
+  const systemPrompt = isAnchorAware ? SYSTEM_PROMPT + ANCHOR_AWARE_SYSTEM_SUFFIX : SYSTEM_PROMPT;
+  const responseFormat = isAnchorAware ? RESPONSE_FORMAT_WITH_ANCHORS : RESPONSE_FORMAT;
 
   // DRIFT-test3-032: wrap in shared retry. Caller (per-chapter.ts) keeps
   // fail-open semantics — if all retries exhaust, the FidelityCheckError
@@ -165,15 +289,28 @@ export async function scoreFidelity(args: FidelityCheckArgs): Promise<FidelityCh
     operationName: 'fidelity-check',
     abortSignal,
     isParseError: (err) => err instanceof FidelityCheckError,
-    fn: async () => {
+    fn: async (attempt) => {
+      // Wave-3 review HIGH 3C-H1 fix: honor `withRetry`'s attempt index.
+      // On a parse-retry (attempt > 0), append a stricter JSON-only
+      // reminder so the second attempt has a different prompt than the
+      // first. Strict-mode schema already enforces shape at the API
+      // boundary, but the reminder gives the model a more emphatic
+      // instruction for the rare cases where the schema-validation
+      // path produced text outside the JSON block. Mirrors the pattern
+      // in streaming.ts + anchor-scorer.ts (Wave-2 fix-up).
+      const effectiveUserPrompt =
+        attempt > 0
+          ? `${userPrompt}\n\n[RETRY NOTE: the previous attempt produced output that did not conform to the response schema. Emit ONLY valid JSON matching the schema; no prose, no markdown fence.]`
+          : userPrompt;
+
       const response = await openai.chat.completions.create(
         {
           model: MODEL,
           messages: [
-            { role: 'system', content: SYSTEM_PROMPT },
-            { role: 'user', content: userPrompt },
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: effectiveUserPrompt },
           ],
-          response_format: RESPONSE_FORMAT,
+          response_format: responseFormat,
           max_tokens: MAX_COMPLETION_TOKENS,
           temperature: 0,
         },
@@ -190,7 +327,7 @@ export async function scoreFidelity(args: FidelityCheckArgs): Promise<FidelityCh
       } catch (err) {
         throw new FidelityCheckError(`JSON.parse failed: ${(err as Error).message}`, text);
       }
-      if (!isFidelityShape(parsed)) {
+      if (!isFidelityShape(parsed, isAnchorAware)) {
         throw new FidelityCheckError('response did not match fidelity schema', text);
       }
 
@@ -204,6 +341,12 @@ export async function scoreFidelity(args: FidelityCheckArgs): Promise<FidelityCh
         terminologicalContrastsMissing: parsed.terminological_contrasts_missing,
         overallScore: parsed.overall_score,
         notes: parsed.notes,
+        whitelistAnchorsPreserved: isAnchorAware
+          ? (parsed.whitelist_anchors_preserved ?? null)
+          : null,
+        whitelistAnchorsMissing: isAnchorAware
+          ? (parsed.whitelist_anchors_missing ?? null)
+          : null,
         promptTokens,
         completionTokens,
         costUsd,
@@ -213,7 +356,7 @@ export async function scoreFidelity(args: FidelityCheckArgs): Promise<FidelityCh
   });
 }
 
-function isFidelityShape(x: unknown): x is {
+interface FidelityParsedShape {
   specific_numbers_preserved: number;
   named_examples_preserved: number;
   terminological_contrasts_preserved: number;
@@ -222,10 +365,14 @@ function isFidelityShape(x: unknown): x is {
   terminological_contrasts_missing: number;
   overall_score: number;
   notes: string[];
-} {
+  whitelist_anchors_preserved?: number;
+  whitelist_anchors_missing?: number;
+}
+
+function isFidelityShape(x: unknown, requireWhitelistFields: boolean): x is FidelityParsedShape {
   if (typeof x !== 'object' || x === null) return false;
   const o = x as Record<string, unknown>;
-  return (
+  const baseOk =
     typeof o.specific_numbers_preserved === 'number' &&
     typeof o.named_examples_preserved === 'number' &&
     typeof o.terminological_contrasts_preserved === 'number' &&
@@ -233,6 +380,13 @@ function isFidelityShape(x: unknown): x is {
     typeof o.named_examples_missing === 'number' &&
     typeof o.terminological_contrasts_missing === 'number' &&
     typeof o.overall_score === 'number' &&
-    Array.isArray(o.notes)
-  );
+    Array.isArray(o.notes);
+  if (!baseOk) return false;
+  if (requireWhitelistFields) {
+    return (
+      typeof o.whitelist_anchors_preserved === 'number' &&
+      typeof o.whitelist_anchors_missing === 'number'
+    );
+  }
+  return true;
 }
