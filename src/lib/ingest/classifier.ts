@@ -27,6 +27,7 @@
 //     paragraphs — all live in chunker.ts.
 
 import { openai } from '@/lib/openai/client';
+import { withRetry } from '@/lib/openai/_retry';
 import type { PdfOutlineEntry } from '@/lib/pdf/parse';
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -152,15 +153,23 @@ async function classifyBatchViaLLM(
     `Entries:\n` +
     ambiguous.map((a) => `  ${a.idx}. ${a.title}`).join('\n');
 
-  const response = await openai.chat.completions.create({
-    model: CLASSIFIER_MODEL,
-    messages: [
-      { role: 'system', content: CLASSIFIER_SYSTEM_PROMPT },
-      { role: 'user', content: userPrompt },
-    ],
-    response_format: { type: 'json_object' },
-    max_tokens: 2000,
-    temperature: 0,
+  // DRIFT-test3-032: wrap in shared retry. A 429 here previously threw to
+  // the orchestrator's catch-block and defaulted the WHOLE batch to 'body'
+  // (which over-emits chunks for front-matter / appendices / glossary).
+  // With retry, transient 429s get 3 attempts before the fail-open kicks in.
+  const response = await withRetry({
+    operationName: 'classifier',
+    fn: async () =>
+      openai.chat.completions.create({
+        model: CLASSIFIER_MODEL,
+        messages: [
+          { role: 'system', content: CLASSIFIER_SYSTEM_PROMPT },
+          { role: 'user', content: userPrompt },
+        ],
+        response_format: { type: 'json_object' },
+        max_tokens: 2000,
+        temperature: 0,
+      }),
   });
 
   const text = response.choices[0]?.message?.content ?? '';
