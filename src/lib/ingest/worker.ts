@@ -43,6 +43,8 @@ import {
   chunksPrefix,
   chunksExist,
   readMetadata,
+  readVoiceProfile,
+  readAnchorWhitelist,
   writeChunk,
   writeMetadata,
   writeGlossary,
@@ -101,6 +103,32 @@ export async function ingestWorker(tutorialId: string): Promise<void> {
       // it, skip all parse + LLM work entirely.
       metadata = await readMetadata(bucket, sha256);
       pageCount = metadata.pageCount;
+
+      // Wave-3 review HIGH 3A-H1 (visibility fix): the cache-hit fast path
+      // skips voice + anchor extraction entirely. If a PRIOR ingest crashed
+      // AFTER writing chunks + metadata but BEFORE writing voice_profile.json
+      // OR anchor_whitelist.json (narrow window because both are written in
+      // Promise.all after chunks land), the subsequent cache-hit run silently
+      // degrades chapters generated from this tutorial to v3-prompt behavior
+      // without surfacing the gap. Probe both artifacts and warn so operators
+      // can manually invalidate the cache (remove the metadata.json) to
+      // trigger a full re-ingest if they want the source-grounding signal.
+      // Re-extraction inline is deliberately NOT implemented here — it
+      // would require fetching all body chunks from S3, which is a heavier
+      // code path than this visibility patch.
+      const [vp, aw] = await Promise.all([
+        readVoiceProfile({ bucket, pdfSha256: sha256 }).catch(() => null),
+        readAnchorWhitelist({ bucket, pdfSha256: sha256 }).catch(() => null),
+      ]);
+      if (!vp || !aw) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[ingest:cache-hit:${sha256.slice(0, 8)}] tutorial cached without complete Feature B' artifacts ` +
+            `(voice_profile=${vp ? 'present' : 'MISSING'}, anchor_whitelist=${aw ? 'present' : 'MISSING'}). ` +
+            `Generated chapters will fall back to v3 prompt behavior. To re-extract, invalidate the cache ` +
+            `by deleting s3://${bucket}/${sha256}/metadata.json and re-ingesting.`,
+        );
+      }
     } else {
       // Cache miss: full pipeline. Parse → classify → chunk → glossary →
       // write to S3 → build metadata.

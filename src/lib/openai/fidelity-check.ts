@@ -218,11 +218,21 @@ export async function scoreFidelity(args: FidelityCheckArgs): Promise<FidelityCh
   // asked to preserve anchors the source actually contained. An empty
   // whitelist OR no source-side hits collapses to the pre-Wave-3 path
   // (prompt + schema byte-for-byte preserved, result fields null).
+  //
+  // Wave-3 review HIGH 3C-H2 fix: defensive cap on whitelist injection.
+  // Upstream (Wave 2A's scorer) caps the whitelist at 30, but this module
+  // is the last point before the prompt hits the LLM, so it enforces its
+  // own ceiling rather than trusting the upstream contract. With 30
+  // chunk-relevant entries at ~20 tokens each, the section is ~600 input
+  // tokens — below the noise floor.
+  const MAX_FIDELITY_WHITELIST_ENTRIES = 30;
   const chunkRelevantAnchors: AnchorWhitelistEntry[] =
     anchorWhitelist && anchorWhitelist.length > 0
-      ? anchorWhitelist.filter((anchor) =>
-          sourceParagraphs.some((p) => containsAnchor(p.text, anchor.term)),
-        )
+      ? anchorWhitelist
+          .filter((anchor) =>
+            sourceParagraphs.some((p) => containsAnchor(p.text, anchor.term)),
+          )
+          .slice(0, MAX_FIDELITY_WHITELIST_ENTRIES)
       : [];
   const isAnchorAware = chunkRelevantAnchors.length > 0;
 
@@ -279,13 +289,26 @@ export async function scoreFidelity(args: FidelityCheckArgs): Promise<FidelityCh
     operationName: 'fidelity-check',
     abortSignal,
     isParseError: (err) => err instanceof FidelityCheckError,
-    fn: async () => {
+    fn: async (attempt) => {
+      // Wave-3 review HIGH 3C-H1 fix: honor `withRetry`'s attempt index.
+      // On a parse-retry (attempt > 0), append a stricter JSON-only
+      // reminder so the second attempt has a different prompt than the
+      // first. Strict-mode schema already enforces shape at the API
+      // boundary, but the reminder gives the model a more emphatic
+      // instruction for the rare cases where the schema-validation
+      // path produced text outside the JSON block. Mirrors the pattern
+      // in streaming.ts + anchor-scorer.ts (Wave-2 fix-up).
+      const effectiveUserPrompt =
+        attempt > 0
+          ? `${userPrompt}\n\n[RETRY NOTE: the previous attempt produced output that did not conform to the response schema. Emit ONLY valid JSON matching the schema; no prose, no markdown fence.]`
+          : userPrompt;
+
       const response = await openai.chat.completions.create(
         {
           model: MODEL,
           messages: [
             { role: 'system', content: systemPrompt },
-            { role: 'user', content: userPrompt },
+            { role: 'user', content: effectiveUserPrompt },
           ],
           response_format: responseFormat,
           max_tokens: MAX_COMPLETION_TOKENS,

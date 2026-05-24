@@ -166,6 +166,63 @@ export async function generateChapter(
   }
   onNarrativeComplete?.(narrativeResult.narrative);
 
+  // ── 4.5. Validate whitelist-anchor coverage (Feature B' Wave 3) ──────
+  //
+  // Wave-3 review HIGH 3B-H1 fix: moved from Step 6.5 to Step 4.5 — runs
+  // AFTER narrative generation but BEFORE quiz generation, matching the
+  // design doc §Component 4 ordering. This lets a future regen-with-
+  // feedback path (Open Decision D4, currently log-and-continue) regenerate
+  // the narrative with anchor-aware feedback BEFORE the quiz consumes it.
+  // Today's behavior is identical either way (log-and-continue is a
+  // no-op for ordering); the move is a forward-compat correctness fix.
+  //
+  // Pure-function validator from anchor-validator.ts. Only runs when we have
+  // an anchor_whitelist artifact in S3 (i.e., the tutorial was ingested with
+  // Feature B' active). When violations are detected, persist ONE row to
+  // chapter_anchor_violations (policy: log-and-continue per design §D4 —
+  // no forced regeneration in v1). When all anchors are preserved, the
+  // ABSENCE of a row IS the success signal — no DB write needed.
+  //
+  // Fail-open semantics: validateAnchors is pure (can't throw under normal
+  // conditions), but if the violations INSERT fails for any reason
+  // (transient SQLite lock, etc.), we log + continue. Chapter completion
+  // takes priority over audit-row persistence.
+  if (anchorWhitelist && anchorWhitelist.length > 0) {
+    try {
+      const validation = validateAnchors({
+        narrative: narrativeResult.narrative,
+        sourceParagraphs,
+        whitelist: anchorWhitelist,
+      });
+      if (validation.missing.length > 0) {
+        const missingTerms = validation.missing.map((m) => m.term);
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[per-chapter] anchor coverage violation for ${chapter.id}: ` +
+            `${validation.missing.length}/${validation.expected.length} dropped ` +
+            `(score=${validation.score.toFixed(3)}); missing=${JSON.stringify(missingTerms)}`,
+        );
+        db.insert(chapterAnchorViolations)
+          .values({
+            id: crypto.randomUUID(),
+            chapterId: chapter.id,
+            expectedCount: validation.expected.length,
+            foundCount: validation.found.length,
+            missingAnchorsJson: JSON.stringify(missingTerms),
+            score: validation.score,
+            policyApplied: 'log-and-continue',
+            regenTriggered: 0,
+          })
+          .run();
+      }
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error(
+        `[per-chapter] anchor validation failed for ${chapter.id}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
   // ── 5. Generate quiz + flashcards (4o-mini, non-streaming) ─────────────
   let quizResult;
   try {
@@ -252,54 +309,6 @@ export async function generateChapter(
       .run();
   });
 
-  // ── 6.5. Validate whitelist-anchor coverage (Feature B' Wave 3) ──────
-  // Pure-function validator from anchor-validator.ts. Only runs when we have
-  // an anchor_whitelist artifact in S3 (i.e., the tutorial was ingested with
-  // Feature B' active). When violations are detected, persist ONE row to
-  // chapter_anchor_violations (policy: log-and-continue per design §D4 —
-  // no forced regeneration in v1). When all anchors are preserved, the
-  // ABSENCE of a row IS the success signal — no DB write needed.
-  //
-  // Fail-open semantics: validateAnchors is pure (can't throw under normal
-  // conditions), but if the violations INSERT fails for any reason
-  // (transient SQLite lock, etc.), we log + continue. Chapter completion
-  // takes priority over audit-row persistence.
-  if (anchorWhitelist && anchorWhitelist.length > 0) {
-    try {
-      const validation = validateAnchors({
-        narrative: narrativeResult.narrative,
-        sourceParagraphs,
-        whitelist: anchorWhitelist,
-      });
-      if (validation.missing.length > 0) {
-        const missingTerms = validation.missing.map((m) => m.term);
-        // eslint-disable-next-line no-console
-        console.warn(
-          `[per-chapter] anchor coverage violation for ${chapter.id}: ` +
-            `${validation.missing.length}/${validation.expected.length} dropped ` +
-            `(score=${validation.score.toFixed(3)}); missing=${JSON.stringify(missingTerms)}`,
-        );
-        db.insert(chapterAnchorViolations)
-          .values({
-            id: crypto.randomUUID(),
-            chapterId: chapter.id,
-            expectedCount: validation.expected.length,
-            foundCount: validation.found.length,
-            missingAnchorsJson: JSON.stringify(missingTerms),
-            score: validation.score,
-            policyApplied: 'log-and-continue',
-            regenTriggered: 0,
-          })
-          .run();
-      }
-    } catch (err) {
-      // eslint-disable-next-line no-console
-      console.error(
-        `[per-chapter] anchor validation failed for ${chapter.id}: ${(err as Error).message}`,
-      );
-    }
-  }
-
   // ── 7. Score narrative-vs-source fidelity (DRIFT-test3-022) ──────────
   // Run a separate 4o-mini call to count preserved concrete anchors. Fail-
   // open: if the scorer errors, we proceed without a score (the chapter is
@@ -307,19 +316,18 @@ export async function generateChapter(
   // fidelity" rather than blocking the read path).
   let fidelityCostUsd = 0;
   try {
+    // Feature B' Wave 3 — pass the whitelist so the scorer can populate
+    // whitelistAnchorsPreserved + whitelistAnchorsMissing columns (added
+    // to chapter_fidelity_scores by Wave 1C migration 0004). Wave 3C
+    // landed; FidelityCheckArgs accepts this optional field natively
+    // (cast removed during Wave-3 fix-up — honesty-auditor MINOR finding).
     const fidelity = await scoreFidelity({
       chapterTitle: chapter.title,
       narrative: narrativeResult.narrative,
       sourceParagraphs,
       abortSignal,
-      // Feature B' Wave 3 — pass the whitelist so the scorer can populate
-      // whitelistAnchorsPreserved + whitelistAnchorsMissing columns (added
-      // to chapter_fidelity_scores by Wave 1C migration). Wave 3C extends
-      // FidelityCheckArgs to accept this optional field; until that lands
-      // upstream, the assertion below keeps TypeScript green. The runtime
-      // value flows through unmodified on either side of the merge.
       ...(anchorWhitelist ? { anchorWhitelist } : {}),
-    } as Parameters<typeof scoreFidelity>[0]);
+    });
     fidelityCostUsd = fidelity.costUsd;
     db.transaction((tx) => {
       tx.insert(chapterFidelityScores)
@@ -334,6 +342,12 @@ export async function generateChapter(
           terminologicalContrastsMissing: fidelity.terminologicalContrastsMissing,
           overallScore: fidelity.overallScore,
           notesJson: JSON.stringify(fidelity.notes),
+          // Wave-3 fix-up (honesty-auditor MINOR promoted to HIGH):
+          // wire the new anchor-aware fields into chapter_fidelity_scores.
+          // Migration 0004 added these as nullable; null when the scorer
+          // ran without a whitelist (pre-Feature-B' tutorials).
+          whitelistAnchorsPreserved: fidelity.whitelistAnchorsPreserved,
+          whitelistAnchorsMissing: fidelity.whitelistAnchorsMissing,
           model: fidelity.model,
           promptTokens: fidelity.promptTokens,
           completionTokens: fidelity.completionTokens,

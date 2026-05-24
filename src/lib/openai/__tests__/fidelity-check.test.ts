@@ -38,6 +38,7 @@ vi.mock('@/lib/openai/client', () => ({
 
 // Imports AFTER vi.mock.
 import { scoreFidelity, FidelityCheckError } from '../fidelity-check';
+import { maxAttempts } from '../_retry';
 
 // ───────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -386,8 +387,13 @@ describe('scoreFidelity — anchor-aware path (anchorWhitelist with chunk-releva
       notes: ['no whitelist fields'],
       // whitelist_anchors_preserved / missing deliberately omitted.
     });
-    // Saturate retries with the same bad payload so withRetry surfaces it.
-    for (let i = 0; i < 10; i++) {
+    // Wave-3 review HIGH 3C-H3 fix: pin loop count to withRetry's actual
+    // maxAttempts (currently 7: 1 initial + 3 rateLimit + 2 serverError +
+    // 1 parseError slots). Previously the loop hardcoded 10 and passed by
+    // accident (10 > 7). If a future tightening reduces the budget, this
+    // assertion catches it.
+    const attempts = maxAttempts();
+    for (let i = 0; i < attempts; i++) {
       createMock.mockResolvedValueOnce(mockCompletion(badJson));
     }
 
@@ -399,5 +405,9 @@ describe('scoreFidelity — anchor-aware path (anchorWhitelist with chunk-releva
         anchorWhitelist: [mkAnchor('t-digest')],
       }),
     ).rejects.toBeInstanceOf(FidelityCheckError);
+
+    // Confirm withRetry walked the full retry budget — every slot was
+    // consumed before the FidelityCheckError surfaced.
+    expect(createMock.mock.calls.length).toBe(attempts);
   });
 });
