@@ -395,9 +395,46 @@ export function StreamingClient(props: StreamingClientProps) {
     }
   }, []);
 
+  // ── DRIFT-test3-019: per-chapter SSE ───────────────────────────────
+  //
+  // Compute the currently-active chapter ordinal: the lowest-ordinal chapter
+  // that is BOTH (a) unlocked per the server-side ratchet
+  // (ordinal <= maxUnlockedChapterIdx) AND (b) not yet complete from the
+  // reader's perspective.
+  //
+  // There is at most ONE active chapter at a time because the ratchet is
+  // monotonic and gating is one-way. When the active chapter completes and
+  // the user clicks Mark Complete, the server bumps the ratchet and
+  // router.refresh() re-runs the parent Server Component; that re-render
+  // hands us a new maxUnlockedChapterIdx and an updated initialChapters row
+  // marked complete, so activeChapterIdx flips to the next ordinal.
+  //
+  // useStreamingChapter sees chapterIdx change in deps → tears down the old
+  // EventSource and opens a fresh one targeted at the new chapter. No clean
+  // navigation required (the old failure mode this fix addresses).
+  //
+  // If no chapter is currently active (all unlocked chapters complete, or
+  // user hasn't started yet), pass paused=true so the hook holds idle and
+  // doesn't open a stream. The "all unlocked chapters complete" state is
+  // the natural waiting room for the next Mark Complete.
+  const activeChapterIdx = useMemo<number | undefined>(() => {
+    const sorted = Array.from(chapterMap.values()).sort((a, b) => a.ordinal - b.ordinal);
+    for (const c of sorted) {
+      if (c.ordinal > maxUnlockedChapterIdx) break; // ratchet boundary
+      const initialRow = initialChapters.find((ic) => ic.id === c.id);
+      const isComplete =
+        c.status === 'complete' ||
+        (initialRow?.status === 'complete' || initialRow?.status === 'partial');
+      if (!isComplete) return c.ordinal;
+    }
+    return undefined;
+  }, [chapterMap, initialChapters, maxUnlockedChapterIdx]);
+
   const { status, error, cancel, reconnectCount } = useStreamingChapter({
     tutorialId,
+    chapterIdx: activeChapterIdx,
     onFrame: handleFrame,
+    paused: activeChapterIdx === undefined,
   });
 
   // Reflect hook-level errors into the protocol-error surface too (so the
