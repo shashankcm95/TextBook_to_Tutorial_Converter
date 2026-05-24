@@ -61,7 +61,7 @@
  */
 
 import { type NextRequest } from 'next/server';
-import { eq, and, asc } from 'drizzle-orm';
+import { eq, and, asc, isNotNull } from 'drizzle-orm';
 import { db, schema } from '@/db/client';
 import { verifySession, SESSION_COOKIE_NAME } from '@/lib/session';
 import { env } from '@/lib/env';
@@ -465,7 +465,22 @@ async function orchestrate(args: OrchestrateArgs): Promise<void> {
       sourceParagraphsJson: schema.chapters.sourceParagraphsJson,
     })
     .from(schema.chapters)
-    .where(eq(schema.chapters.tutorialId, tutorialId))
+    .where(
+      and(
+        eq(schema.chapters.tutorialId, tutorialId),
+        // ── lazy-hybrid-chunking gating (Commit 3) ──
+        // Only generate chapters that have been released by the ratchet.
+        // Chapter 0 is released at ingest; subsequent chapters unlock when
+        // the prior chapter's completion_criteria_met is set via
+        // POST /chapters/:idx/complete. Generating only released chapters
+        // means the legacy bulk-stream endpoint now respects the gate
+        // server-side. UI also gates display client-side; defense in depth.
+        isNotNull(schema.chapters.releasedAt),
+        // Body-only generation — appendices are on-demand via the new
+        // per-chapter endpoint (Commit 2), not here.
+        eq(schema.chapters.classification, 'body'),
+      ),
+    )
     .orderBy(asc(schema.chapters.ordinal));
 
   // Flip the tutorial to 'generating' if it isn't already (idempotent — only

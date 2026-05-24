@@ -93,6 +93,16 @@ export const tutorials = sqliteTable(
     createdAt: integer('created_at', { mode: 'timestamp' })
       .notNull()
       .default(sql`CURRENT_TIMESTAMP`),
+    // ── lazy-hybrid-chunking (0001 migration) ────────────────────────
+    /** S3 key prefix for parsed-chunk artifacts: `parsed/<sha256>`. NULL
+     *  on legacy rows ingested before the lazy-chunking pipeline. */
+    parsedS3Prefix: text('parsed_s3_prefix'),
+    /** One-way ratchet: max chapter ordinal the user has unlocked. Increases
+     *  only; never decreases. Initialized to 0 at ingest (chapter 0 visible). */
+    maxUnlockedChapterIdx: integer('max_unlocked_chapter_idx').notNull().default(0),
+    /** Schema version of the outline classifier that ran at ingest. Cache-
+     *  invalidate when the classifier algorithm changes. */
+    outlineClassificationVersion: integer('outline_classification_version').notNull().default(1),
   },
   (t) => ({
     byUser: index('idx_tutorials_user').on(t.userId),
@@ -149,9 +159,35 @@ export const chapters = sqliteTable(
     timeSpentSeconds: integer('time_spent_seconds').notNull().default(0),
     lastQuizAttemptAt: integer('last_quiz_attempt_at', { mode: 'timestamp' }),
     lastQuizScore: real('last_quiz_score'),                            // 0.0 – 1.0
+
+    // ── lazy-hybrid-chunking (0001 migration) ────────────────────────
+    /** body = real chapter, generated + gated. appendix = on-demand only. */
+    classification: text('classification', { enum: ['body', 'appendix'] as const })
+      .notNull()
+      .default('body'),
+    /** S3 key for this chapter's chunk artifact (parsed/<sha>/chapters/NN.json).
+     *  NULL for legacy rows; required for rows inserted by the new worker. */
+    chunkS3Key: text('chunk_s3_key'),
+    /** TOC-tree navigation: parent grouping (e.g., "Part I" for Chapter 1-4).
+     *  v1 leaves null for flat structure; v2+ populates for nested nav. */
+    parentChapterId: text('parent_chapter_id'),
+    /** Outline depth at which this chunk was emitted. 0 = top-level. */
+    depth: integer('depth').notNull().default(0),
+    /** When the gating ratchet released this chapter for the user. NULL = locked.
+     *  Ordinal 0 gets released_at=ingest-time. Subsequent chapters get a value
+     *  when prior chapter's completion criteria met. */
+    releasedAt: integer('released_at', { mode: 'timestamp' }),
+    /** 0/1 flag (sqlite boolean). Set server-side by the gating release policy. */
+    completionCriteriaMet: integer('completion_criteria_met', { mode: 'boolean' })
+      .notNull()
+      .default(false),
+    /** Cached count from chunker; saves a re-scan downstream. */
+    paragraphCount: integer('paragraph_count').notNull().default(0),
   },
   (t) => ({
     byTutorialOrdinal: index('idx_chapters_tutorial_ordinal').on(t.tutorialId, t.ordinal),
+    byReleased: index('idx_chapters_released').on(t.tutorialId, t.releasedAt),
+    byParent: index('idx_chapters_parent').on(t.parentChapterId),
   }),
 );
 
@@ -288,6 +324,66 @@ export type ParseCost = typeof parsesCost.$inferSelect;
 export type NewParseCost = typeof parsesCost.$inferInsert;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// glossary_terms — side-asset extracted from `glossary`-classified outline
+// entries by glossary-extract.ts (4o-mini call during ingest).
+//
+// Cross-chapter lookup: chapter renderer can resolve a term tooltip without
+// re-fetching the originating chapter's content. Loaded once per tutorial.
+// ─────────────────────────────────────────────────────────────────────────────
+export const glossaryTerms = sqliteTable(
+  'glossary_terms',
+  {
+    id: text('id').primaryKey(),
+    tutorialId: text('tutorial_id')
+      .notNull()
+      .references(() => tutorials.id, { onDelete: 'cascade' }),
+    term: text('term').notNull(),
+    definition: text('definition').notNull(),
+    sourceParagraphRef: text('source_paragraph_ref').notNull(),        // "pageN:paragraphM"
+    createdAt: integer('created_at', { mode: 'timestamp' })
+      .notNull()
+      .default(sql`(unixepoch())`),
+  },
+  (t) => ({
+    byTutorial: index('idx_glossary_tutorial').on(t.tutorialId),
+    byTerm: index('idx_glossary_term ').on(t.tutorialId, t.term),
+  }),
+);
+
+export type GlossaryTerm = typeof glossaryTerms.$inferSelect;
+export type NewGlossaryTerm = typeof glossaryTerms.$inferInsert;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// skipped_sections — audit trail for front-matter / bibliography / index
+// classifier decisions. Lets the UI explain "Foreword skipped" + link to PDF.
+// ─────────────────────────────────────────────────────────────────────────────
+export const SKIPPED_CLASSIFICATIONS = [
+  'front-matter',
+  'bibliography',
+  'glossary',
+  'index',
+] as const;
+
+export const skippedSections = sqliteTable(
+  'skipped_sections',
+  {
+    tutorialId: text('tutorial_id')
+      .notNull()
+      .references(() => tutorials.id, { onDelete: 'cascade' }),
+    outlineTitle: text('outline_title').notNull(),
+    classification: text('classification', { enum: SKIPPED_CLASSIFICATIONS }).notNull(),
+    pageStart: integer('page_start').notNull(),
+    pageEnd: integer('page_end').notNull(),
+  },
+  (t) => ({
+    pk: primaryKey({ columns: [t.tutorialId, t.outlineTitle] }),
+  }),
+);
+
+export type SkippedSection = typeof skippedSections.$inferSelect;
+export type NewSkippedSection = typeof skippedSections.$inferInsert;
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Re-export aggregate — convenience for `import * as schema from './schema'`
 // (drizzle migrator requires the schema namespace at runtime).
 // ─────────────────────────────────────────────────────────────────────────────
@@ -299,4 +395,6 @@ export const schema = {
   flashcards,
   srsReviews,
   parsesCost,
+  glossaryTerms,
+  skippedSections,
 };

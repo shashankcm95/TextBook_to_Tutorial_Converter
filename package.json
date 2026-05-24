@@ -13,7 +13,8 @@
     "start": "next start",
     "lint": "next lint",
     "db:generate": "drizzle-kit generate",
-    "db:migrate": "tsx src/db/migrate.ts",
+    "db:migrate": "node scripts/db-migrate.js",
+    "db:migrate:status": "node scripts/db-migrate.js --status",
     "db:seed": "tsx src/db/seed.ts",
     "test": "vitest run",
     "test:phase0": "bash scripts/phase0-gate.sh"

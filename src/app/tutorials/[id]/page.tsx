@@ -107,6 +107,8 @@ export default async function TutorialPage({ params }: TutorialPageProps) {
       status: schema.tutorials.status,
       totalChapters: schema.tutorials.totalChapters,
       errorMessage: schema.tutorials.errorMessage,
+      // ── lazy-hybrid-chunking gating ratchet (Commit 1 / 3) ──
+      maxUnlockedChapterIdx: schema.tutorials.maxUnlockedChapterIdx,
     })
     .from(schema.tutorials)
     .where(
@@ -119,6 +121,7 @@ export default async function TutorialPage({ params }: TutorialPageProps) {
   if (tutorialRows.length === 0) {
     notFound();
   }
+  const tutorial = tutorialRows[0]!;
 
   // ── 5. Load chapters (all fields incl. riley HIGH-2 observational columns) ──
   const initialChapters = await db
@@ -182,6 +185,7 @@ export default async function TutorialPage({ params }: TutorialPageProps) {
       initialChapters={initialChapters}
       initialReviewCards={initialReviewCards}
       csrfToken={csrfToken}
+      maxUnlockedChapterIdx={tutorial.maxUnlockedChapterIdx}
     />
   );
 }
