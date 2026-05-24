@@ -287,6 +287,15 @@ export function StreamingClient(props: StreamingClientProps) {
    * triggering the hook's effect on every render.
    */
   const handleFrame = useCallback((frame: StreamFrame): void => {
+    // DRIFT-test3-021 fix: clear any stale protocolError as soon as a
+    // successful frame (anything that's not 'error') arrives. This handles
+    // the common case where the EventSource hit a 409 during the tutorial-
+    // is-still-ingesting window, synthesized a Protocol Error, then
+    // reconnected and got a healthy stream — without this reset, the red
+    // banner would persist for the rest of the session.
+    if (frame.event !== 'error') {
+      setProtocolError((prev) => (prev === null ? prev : null));
+    }
     switch (frame.event) {
       case 'chapter-start': {
         const payload = parseChapterStart(frame.data);
@@ -393,13 +402,20 @@ export function StreamingClient(props: StreamingClientProps) {
 
   // Reflect hook-level errors into the protocol-error surface too (so the
   // user sees a clear failure on EventSource exhaustion).
+  //
+  // DRIFT-test3-021 fix: only surface the hook's error when the connection
+  // is ACTUALLY in a failure state (status='failed') — not during a
+  // transient reconnect that may have already recovered. The frame handler
+  // resets protocolError when healthy frames arrive; that reset would be
+  // immediately undone by this effect if it weren't gated on status.
   useEffect(() => {
+    if (status !== 'failed') return;
     if (error !== null && protocolError === null) {
       // The hook sets a generic Error; encode it into our shape.
       const code = (error as Error & { code?: string }).code ?? 'stream-failed';
       setProtocolError({ code, message: error.message });
     }
-  }, [error, protocolError]);
+  }, [error, protocolError, status]);
 
   // Sort chapters by ordinal for stable display.
   const orderedChapters = useMemo(() => {
