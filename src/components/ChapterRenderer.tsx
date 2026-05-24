@@ -52,6 +52,7 @@ import type { Components } from 'react-markdown';
 import type { SourceParagraph } from '@/lib/types';
 import { CitationModal } from './CitationModal';
 import { LessonCanvas } from './LessonCanvas';
+import { MermaidDiagram } from './MermaidDiagram';
 
 // ───────────────────────────────────────────────────────────────────────────
 // Citation regex + tokenizer
@@ -271,6 +272,40 @@ export function ChapterRenderer({ narrative, sourceParagraphs }: ChapterRenderer
       h6: ({ children, ...rest }) => <h6 {...rest}>{tokenizeChildren(children)}</h6>,
       em: ({ children, ...rest }) => <em {...rest}>{tokenizeChildren(children)}</em>,
       strong: ({ children, ...rest }) => <strong {...rest}>{tokenizeChildren(children)}</strong>,
+      // Sprint-Bv2.5: detect ```mermaid fenced blocks and render them as
+      // an actual SVG diagram via the MermaidDiagram component. react-
+      // markdown passes the code block's language as a className like
+      // `language-mermaid`; falling back to the default render for any
+      // other language preserves syntax-highlighting / plain code blocks.
+      //
+      // The `inline` flag (true for inline `<code>` like `foo`) is
+      // explicitly passed-through unchanged — inline code never becomes
+      // a diagram, only fenced blocks.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      code: ({ inline, className, children, ...rest }: any) => {
+        const isMermaid =
+          !inline &&
+          typeof className === 'string' &&
+          /\blanguage-mermaid\b/.test(className);
+        if (isMermaid) {
+          // Mermaid source is the raw text content of the code block.
+          // react-markdown gives us children as an array of strings (or a
+          // single string); join + trim for safety against fence-trailing
+          // whitespace.
+          const source = (Array.isArray(children) ? children.join('') : String(children ?? '')).trim();
+          if (source.length === 0) return null;
+          return <MermaidDiagram source={source} />;
+        }
+        // Default: emit normal <code>. Inline code already gets the
+        // LessonCanvas mono+brand-fade style via the `[&_code]:…`
+        // selectors; we don't tokenize citations inside code (would
+        // mangle a literal `[ref:...]` example).
+        return (
+          <code className={className} {...rest}>
+            {children}
+          </code>
+        );
+      },
     }),
     [tokenizeChildren],
   );

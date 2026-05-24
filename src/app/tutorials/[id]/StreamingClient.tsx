@@ -53,6 +53,7 @@ import { CostChip } from '@/components/CostChip';
 import { CompletionTracker } from '@/components/CompletionTracker';
 import { FlashcardReviewer, type ReviewableCard } from '@/components/FlashcardReviewer';
 import { TutorialHeader } from '@/components/TutorialHeader';
+import type { BookMetadata } from '@/lib/book-metadata';
 
 // ───────────────────────────────────────────────────────────────────────────
 // Props (passed down from the Server Component)
@@ -81,6 +82,14 @@ export interface StreamingClientProps {
    * "due today" stream and remains its own panel).
    */
   initialFlashcardsByChapter?: Record<string, LLMFlashcard[]>;
+  /**
+   * Book metadata derived from the source S3 URL (Sprint Bv2.5).
+   * Replaces the pre-Bv2.5 hardcoded "Designing Data-Intensive
+   * Applications / Martin Kleppmann" that leaked when CLRS or any
+   * other book was ingested. Empty fields fall back to "Untitled
+   * tutorial" inside TutorialHeader.
+   */
+  bookMetadata?: BookMetadata;
   /** CSRF token read from cookie server-side; safe to pass to client island. */
   csrfToken: string;
   /**
@@ -304,6 +313,7 @@ export function StreamingClient(props: StreamingClientProps) {
     initialReviewCards,
     initialQuestionsByChapter,
     initialFlashcardsByChapter,
+    bookMetadata,
     csrfToken,
     maxUnlockedChapterIdx,
   } = props;
@@ -586,10 +596,12 @@ export function StreamingClient(props: StreamingClientProps) {
   ).length;
   const completionPct =
     orderedChapters.length === 0 ? 0 : completedCount / orderedChapters.length;
-  // Book metadata: passed-through hooks for the eventual schema-driven
-  // version. Until then, fall back to the test fixture title.
-  const bookTitle = 'Designing Data-Intensive Applications';
-  const bookAuthor = 'Martin Kleppmann';
+  // Book metadata — Sprint Bv2.5 dynamic version. The page.tsx derives
+  // this from the source S3 URL via bookMetadataFromS3Url(). Fallback
+  // is the same defaults the TutorialHeader uses internally
+  // ("Untitled tutorial" with no author line).
+  const bookTitle = bookMetadata?.bookTitle ?? '';
+  const bookAuthor = bookMetadata?.author ?? '';
 
   return (
     <div className="min-h-screen bg-paper text-ink">
