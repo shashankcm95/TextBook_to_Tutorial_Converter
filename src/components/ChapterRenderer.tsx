@@ -164,6 +164,14 @@ export interface ChapterRendererProps {
    * actual paragraph text shown in CitationModal.
    */
   sourceParagraphs: SourceParagraph[];
+  /**
+   * When true, LessonCanvas renders the Stripe-Press-adjacent drop-cap on
+   * the very first paragraph. Reserved for the FIRST lesson of the FIRST
+   * chapter only — applying it everywhere would feel ornamental, not
+   * editorial. Caller (ChapterLessons) computes this as
+   * `isFirstChapter && lessonIdx === 0`.
+   */
+  isFirstLesson?: boolean;
 }
 
 interface ActiveCitation {
@@ -173,7 +181,7 @@ interface ActiveCitation {
   paragraphEnd?: number;
 }
 
-export function ChapterRenderer({ narrative, sourceParagraphs }: ChapterRendererProps) {
+export function ChapterRenderer({ narrative, sourceParagraphs, isFirstLesson = false }: ChapterRendererProps) {
   const [active, setActive] = useState<ActiveCitation | null>(null);
 
   /**
@@ -328,13 +336,16 @@ export function ChapterRenderer({ narrative, sourceParagraphs }: ChapterRenderer
   // `<LessonCanvas>` (Source Serif 4 at 19/1.75, Newsreader headings,
   // hung punctuation, OpenType ligatures). The CitationModal stays
   // outside the canvas — modals belong at the document root, not
-  // nested inside the lesson typography. drop-cap is opt-in via the
-  // forthcoming `isFirstLesson` prop threaded from ChapterLessons in
-  // a follow-up; today every lesson renders with the same canvas
-  // and no drop-cap.
+  // nested inside the lesson typography.
+  //
+  // Round-2 quick win: drop-cap opt-in via `isFirstLesson` is now threaded
+  // from ChapterLessons (chapter ordinal 0 + lesson idx 0 only). Student
+  // Round-2 found the dead-wire: prior to this, the prop existed in
+  // LessonCanvas but no caller ever set it true, so the "editorial moment"
+  // never fired.
   return (
     <>
-      <LessonCanvas>
+      <LessonCanvas isFirstLesson={isFirstLesson}>
         <ReactMarkdown components={components}>{narrative}</ReactMarkdown>
       </LessonCanvas>
       <CitationModal
