@@ -53,6 +53,9 @@ import { CostChip } from '@/components/CostChip';
 import { CompletionTracker } from '@/components/CompletionTracker';
 import { FlashcardReviewer, type ReviewableCard } from '@/components/FlashcardReviewer';
 import { TutorialHeader } from '@/components/TutorialHeader';
+// Sprint C Phase 1: book-style TOC sidebar; replaces the inline 124-row dump
+// as the *navigation* surface (chapter bodies below remain the *content*).
+import { TutorialOutline } from '@/components/TutorialOutline';
 import type { BookMetadata } from '@/lib/book-metadata';
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -655,10 +658,27 @@ export function StreamingClient(props: StreamingClientProps) {
         </div>
       ) : null}
 
-      {/* Body — chapters + sidebar. The lesson canvas (book-typography
-          surface) lives inside ChapterRenderer; this grid just provides
-          the page chrome. */}
-      <div className="mx-auto grid max-w-6xl gap-section px-gutter py-section lg:grid-cols-[1fr_18rem]">
+      {/* Body — outline (Sprint C P1) + chapters + completion sidebar.
+          The lesson canvas (book-typography surface) lives inside
+          ChapterRenderer; this grid just provides the page chrome.
+          Sprint C Phase 1: added a left TutorialOutline column on desktop
+          so the 124-chapter dump stops doubling as navigation. */}
+      <div className="mx-auto grid max-w-6xl gap-section px-gutter py-section lg:grid-cols-[14rem_1fr_18rem]">
+        <TutorialOutline
+          chapters={orderedChapters.map((c) => {
+            const initialRow = initialChapters.find((ic) => ic.id === c.id);
+            return {
+              id: c.id,
+              ordinal: c.ordinal,
+              title: c.title,
+              status: c.status,
+              completionCriteriaMet: initialRow?.completionCriteriaMet === true,
+            };
+          })}
+          currentChapterOrdinal={visibleChapter?.ordinal}
+          tutorialId={tutorialId}
+          maxUnlocked={maxUnlockedChapterIdx}
+        />
         <article className="space-y-section min-w-0">
           {orderedChapters.length === 0 ? (
             <p className="text-sm text-muted-foreground">

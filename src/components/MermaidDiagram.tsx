@@ -123,13 +123,20 @@ export function MermaidDiagram({ source }: MermaidDiagramProps) {
     };
   }, [id, source]);
 
-  // Loading / unrendered state — show the source as a quiet placeholder
-  // so the layout doesn't jump after hydration.
+  // Loading / unrendered state — dashed-border skeleton placeholder so
+  // the layout reserves space without dumping the raw source on the
+  // reader (UX Designer round-2 LOW #7: the source-dump felt like a
+  // half-rendered debug artifact during the hydration moment).
+  // Sprint C Phase 1.
   if (svg === null && error === null) {
     return (
-      <pre className="my-stanza overflow-x-auto rounded-md border border-paper-edge bg-paper-deep px-4 py-3 font-mono text-caption text-ink-muted">
-        <code>{source}</code>
-      </pre>
+      <div
+        className="my-stanza rounded-md border border-dashed border-paper-edge bg-paper-deep/40 px-4 py-12 text-center font-mono text-caption text-ink-faint"
+        role="img"
+        aria-label="Diagram loading"
+      >
+        Rendering diagram…
+      </div>
     );
   }
 
