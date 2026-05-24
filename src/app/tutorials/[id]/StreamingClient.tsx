@@ -52,6 +52,7 @@ import { ChapterLessons } from '@/components/ChapterLessons';
 import { CostChip } from '@/components/CostChip';
 import { CompletionTracker } from '@/components/CompletionTracker';
 import { FlashcardReviewer, type ReviewableCard } from '@/components/FlashcardReviewer';
+import { TutorialHeader } from '@/components/TutorialHeader';
 
 // ───────────────────────────────────────────────────────────────────────────
 // Props (passed down from the Server Component)
@@ -570,35 +571,76 @@ export function StreamingClient(props: StreamingClientProps) {
     );
   }, [orderedChapters, tutorialId]);
 
+  // Sprint-Bv2 surfaces: derive the visible chapter + completion ratio
+  // for the new TutorialHeader. Until per-chapter URL routing lands
+  // (Sprint D), the "current chapter" is the first unlocked-but-not-
+  // complete chapter, falling back to the last unlocked one. Completion
+  // is the same strict-AND metric CompletionTracker uses.
+  const visibleChapter = orderedChapters.find(
+    (c) => c.status === 'complete' || c.status === 'streaming',
+  );
+  // Conservative completion ratio: chapters past the gating ratchet vs
+  // total. Refines to chapter_signals-derived in Sprint D.
+  const completedCount = orderedChapters.filter(
+    (c) => initialChapters.find((ic) => ic.id === c.id)?.completionCriteriaMet === true,
+  ).length;
+  const completionPct =
+    orderedChapters.length === 0 ? 0 : completedCount / orderedChapters.length;
+  // Book metadata: passed-through hooks for the eventual schema-driven
+  // version. Until then, fall back to the test fixture title.
+  const bookTitle = 'Designing Data-Intensive Applications';
+  const bookAuthor = 'Martin Kleppmann';
+
   return (
-    <div className="space-y-6">
-      {/* Header — CostChip is sticky-equivalent: always visible at the top
-          of the tutorial body. riley CRITICAL-cost-placement compliance. */}
-      <header className="sticky top-0 z-10 -mx-4 flex items-center justify-between gap-4 border-b border-border bg-background/95 px-4 py-3 backdrop-blur">
-        <h1 className="truncate text-lg font-semibold">Tutorial</h1>
-        <div className="flex items-center gap-3">
-          <CostChip tutorialId={tutorialId} costUsdLive={costUsdLive} />
-          <StreamStatusBadge status={status} reconnectCount={reconnectCount} />
-          {status === 'streaming' || status === 'reconnecting' ? (
-            <button
-              type="button"
-              onClick={cancel}
-              className="text-xs text-muted-foreground hover:text-foreground focus-visible:outline focus-visible:outline-2 focus-visible:outline-ring"
-            >
-              Stop
-            </button>
-          ) : null}
+    <div className="min-h-screen bg-paper text-ink">
+      {/* Sprint-Bv2 header: brand-bearing, sticky, with title + author +
+          progress ring + cost chip. Status badge + Stop button kept
+          alongside as before but visually demoted to a secondary row. */}
+      <TutorialHeader
+        bookTitle={bookTitle}
+        author={bookAuthor}
+        completionPct={completionPct}
+        currentChapter={
+          visibleChapter
+            ? {
+                ordinal: visibleChapter.ordinal,
+                title: visibleChapter.title,
+              }
+            : undefined
+        }
+        tutorialId={tutorialId}
+      />
+
+      {/* Status + stop slot — quiet sub-header so the brand header stays clean */}
+      {(status === 'streaming' || status === 'reconnecting' || protocolError !== null) ? (
+        <div className="border-b border-paper-edge/50 bg-paper-deep/50">
+          <div className="mx-auto flex max-w-6xl items-center justify-between gap-3 px-gutter py-2">
+            <StreamStatusBadge status={status} reconnectCount={reconnectCount} />
+            {status === 'streaming' || status === 'reconnecting' ? (
+              <button
+                type="button"
+                onClick={cancel}
+                className="font-sans text-caption text-ink-muted underline-offset-2 hover:text-brand hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-brand rounded"
+              >
+                Stop generation
+              </button>
+            ) : null}
+          </div>
         </div>
-      </header>
+      ) : null}
 
       {/* Error banner — surfaces protocol errors prominently */}
       {protocolError !== null ? (
-        <ProtocolErrorBanner code={protocolError.code} message={protocolError.message} />
+        <div className="mx-auto max-w-6xl px-gutter pt-4">
+          <ProtocolErrorBanner code={protocolError.code} message={protocolError.message} />
+        </div>
       ) : null}
 
-      {/* Body — chapters + sidebar */}
-      <div className="grid gap-6 lg:grid-cols-[1fr_18rem]">
-        <article className="space-y-8 min-w-0">
+      {/* Body — chapters + sidebar. The lesson canvas (book-typography
+          surface) lives inside ChapterRenderer; this grid just provides
+          the page chrome. */}
+      <div className="mx-auto grid max-w-6xl gap-section px-gutter py-section lg:grid-cols-[1fr_18rem]">
+        <article className="space-y-section min-w-0">
           {orderedChapters.length === 0 ? (
             <p className="text-sm text-muted-foreground">
               Waiting for the first chapter…
@@ -632,7 +674,7 @@ export function StreamingClient(props: StreamingClientProps) {
                 <section key={c.id} aria-labelledby={`ch-${c.id}-title`}>
                   <h2
                     id={`ch-${c.id}-title`}
-                    className="mb-3 text-xl font-semibold tracking-tight"
+                    className="mx-auto mb-stanza max-w-[36em] font-display text-h1 font-medium tracking-tight text-ink"
                   >
                     {c.ordinal + 1}. {c.title}
                   </h2>
@@ -993,23 +1035,42 @@ interface LockedChapterCardProps {
 }
 
 function LockedChapterCard({ ordinal, title, completePrevOrdinal }: LockedChapterCardProps) {
+  // Sprint-Bv2: paper-deep tile with paper-edge border, ink-muted text,
+  // lucide Lock icon in place of the emoji. The 124-row dump still happens
+  // here today; Sprint C replaces this whole list with the TutorialOutline
+  // (Part-grouped, only-next-3-visible). For now we just make each tile
+  // look like it belongs to the brand.
   return (
     <section
       aria-label={`Chapter ${ordinal + 1} locked`}
-      className="rounded-md border border-dashed border-border bg-muted/20 px-4 py-5"
+      className="rounded-md border border-paper-edge bg-paper-deep/60 px-4 py-4 transition-colors duration-snap hover:border-brand/30"
     >
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
-          <p className="text-xs uppercase tracking-wide text-muted-foreground">Locked</p>
-          <h3 className="mt-1 truncate text-base font-medium text-muted-foreground">
+          <p className="font-mono text-micro uppercase tracking-wider text-ink-faint">
+            Locked
+          </p>
+          <h3 className="mt-1 truncate font-display text-ui-lg font-medium text-ink-muted">
             {ordinal + 1}. {title}
           </h3>
         </div>
-        <span aria-hidden className="text-muted-foreground" title="Locked">
-          🔒
+        <span
+          aria-hidden="true"
+          className="mt-0.5 text-ink-faint"
+          title={`Locked — complete Chapter ${completePrevOrdinal + 1} to unlock`}
+        >
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+            <path
+              d="M3.5 7v-.5a4.5 4.5 0 0 1 9 0V7M2.5 7h11v7h-11z"
+              stroke="currentColor"
+              strokeWidth="1.25"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+          </svg>
         </span>
       </div>
-      <p className="mt-2 text-xs text-muted-foreground">
+      <p className="mt-1 font-sans text-caption text-ink-faint">
         Complete Chapter {completePrevOrdinal + 1} to unlock.
       </p>
     </section>

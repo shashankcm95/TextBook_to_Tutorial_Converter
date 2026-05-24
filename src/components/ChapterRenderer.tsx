@@ -51,6 +51,7 @@ import ReactMarkdown from 'react-markdown';
 import type { Components } from 'react-markdown';
 import type { SourceParagraph } from '@/lib/types';
 import { CitationModal } from './CitationModal';
+import { LessonCanvas } from './LessonCanvas';
 
 // ───────────────────────────────────────────────────────────────────────────
 // Citation regex + tokenizer
@@ -288,9 +289,19 @@ export function ChapterRenderer({ narrative, sourceParagraphs }: ChapterRenderer
     return result;
   }, [active, sourceIndex]);
 
+  // Sprint-Bv2: swap the inline `prose prose-sm` wrapper for the brand
+  // `<LessonCanvas>` (Source Serif 4 at 19/1.75, Newsreader headings,
+  // hung punctuation, OpenType ligatures). The CitationModal stays
+  // outside the canvas — modals belong at the document root, not
+  // nested inside the lesson typography. drop-cap is opt-in via the
+  // forthcoming `isFirstLesson` prop threaded from ChapterLessons in
+  // a follow-up; today every lesson renders with the same canvas
+  // and no drop-cap.
   return (
-    <div className="prose prose-sm dark:prose-invert max-w-none">
-      <ReactMarkdown components={components}>{narrative}</ReactMarkdown>
+    <>
+      <LessonCanvas>
+        <ReactMarkdown components={components}>{narrative}</ReactMarkdown>
+      </LessonCanvas>
       <CitationModal
         open={active !== null}
         page={active?.page ?? 0}
@@ -300,7 +311,7 @@ export function ChapterRenderer({ narrative, sourceParagraphs }: ChapterRenderer
         paragraphs={activeParagraphs}
         onClose={handleClose}
       />
-    </div>
+    </>
   );
 }
 
@@ -333,18 +344,30 @@ function CitationButton({ page, paragraphIdx, paragraphEnd, onClick }: CitationB
     typeof userEnd === 'number' && userEnd !== userStart
       ? `View source: page ${page}, paragraphs ${userStart}–${userEnd}`
       : `View source: page ${page}, paragraph ${userStart}`;
-  const text =
-    typeof userEnd === 'number' && userEnd !== userStart
-      ? `[p.${page} ¶${userStart}-${userEnd}]`
-      : `[p.${page} ¶${userStart}]`;
+
+  // Sprint-Bv2 — superscript "footnote chip" style.
+  //
+  // Pre-Sprint-Bv2 the marker rendered as `[p.26 ¶1-6]` — readable but
+  // inline-code-shaped, which clobbered the reading rhythm. The UX-hybrid
+  // audit (§3.3) calls for a real footnote convention: a small,
+  // superscripted, citation-colored chip that gets out of the way until
+  // the reader wants it.
+  //
+  // We retain the page-and-paragraph numbers in the aria-label for
+  // assistive tech (the visible chip just shows `[p.26]` to stay tiny),
+  // and the click handler still opens the source paragraph(s) in the
+  // citation modal. Once Sprint C lands Radix Popover, this becomes
+  // hover-and-click; for now it stays click-to-open.
   return (
-    <button
-      type="button"
-      onClick={handleClick}
-      aria-label={label}
-      className="inline align-baseline mx-0.5 px-1 py-0 text-xs rounded bg-secondary text-secondary-foreground hover:bg-accent hover:text-accent-foreground focus-visible:outline focus-visible:outline-2 focus-visible:outline-ring"
-    >
-      {text}
-    </button>
+    <sup className="inline-block align-super">
+      <button
+        type="button"
+        onClick={handleClick}
+        aria-label={label}
+        className="mx-0.5 inline-flex items-center rounded-sm bg-citation-fade px-1 py-px font-mono text-[0.6875rem] font-medium leading-none text-citation transition-colors duration-snap ease-decelerate hover:bg-citation hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-citation"
+      >
+        p.{page}
+      </button>
+    </sup>
   );
 }
