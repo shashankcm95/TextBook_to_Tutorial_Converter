@@ -46,8 +46,19 @@ function buildParsedPdf(opts: {
   outline?: PdfOutlineEntry[] | null;
   lowConfidenceScannedImage?: boolean;
 }): ParsedPdf {
+  // `pageCount` reflects the source document's total pages, NOT the count of
+  // pages we happened to parse content for. Real PDF parsers populate this
+  // from the document trailer; tests must mirror that contract.
+  //
+  // Earlier fixture used `opts.pages.length`, which broke any test fixture
+  // that listed sparse pages (e.g., [1, 10, 25, 40] — length=4, but the
+  // document is 40 pages long). The Tier 1 detector's last-chapter pageEnd
+  // = parsedPdf.pageCount, so a stale pageCount made the last chapter's
+  // pageEnd snap to `pages.length`, regressing the "last chapter spans to
+  // document end" contract.
+  const maxPageNumber = opts.pages.reduce((m, p) => Math.max(m, p.pageNumber), 0);
   return {
-    pageCount: opts.pages.length,
+    pageCount: Math.max(maxPageNumber, opts.pages.length),
     pages: opts.pages,
     outline: opts.outline ?? null,
     lowConfidenceScannedImage: opts.lowConfidenceScannedImage ?? false,

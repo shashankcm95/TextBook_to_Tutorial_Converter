@@ -94,6 +94,26 @@ beforeEach(() => {
   currentSession.userId = SESSION_USER_A;
   // Reset module cache so the db singleton picks up the new DB_PATH.
   vi.resetModules();
+  // BUT — src/db/client.ts caches the sqlite handle on globalThis under
+  // `__ttt_sqlite__` (HMR-safety pattern for Next.js dev mode). vi.resetModules
+  // invalidates the module registry but does NOT clear globalThis, so without
+  // this teardown the second test's setupSchema() would reuse the FIRST
+  // test's open handle (pointing at the prior temp DB) and CREATE TABLE
+  // would crash with "table users already exists". Close any stale handle
+  // BEFORE clearing the slot so we don't leak the underlying fd.
+  const g = globalThis as Record<string, unknown> & {
+    __ttt_sqlite__?: { close?: () => void; open?: boolean };
+  };
+  if (g.__ttt_sqlite__ && g.__ttt_sqlite__.open !== false) {
+    try {
+      g.__ttt_sqlite__.close?.();
+    } catch {
+      // Best-effort: a partially-initialized handle may throw; we still want
+      // to clear the slot so the next import opens a fresh connection.
+    }
+  }
+  g.__ttt_sqlite__ = undefined;
+  g.__ttt_drizzle__ = undefined;
 });
 
 afterEach(() => {
