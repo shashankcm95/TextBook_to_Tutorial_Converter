@@ -76,45 +76,22 @@ export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 // ───────────────────────────────────────────────────────────────────────────
-// Concurrent-stream rate limit (mio HIGH-2 fold — Phase 3 challenger absorb)
+// Concurrent-stream rate limit
 // ───────────────────────────────────────────────────────────────────────────
 //
-// Without this, an authenticated user can open N EventSource connections in
-// rapid succession; each triggers `orchestrate()` which begins parallel
-// generation, multiplying OpenAI spend by N before per-tutorial cost-cap
-// catches up. The cost-cap is the financial backstop, but it is not a DoS
-// barrier — server CPU + DB write contention scale linearly with N.
+// The slot tracker now lives in src/lib/streaming-slots.ts (DRIFT-test3-033)
+// and is shared with the per-chapter route. Per-user cap is enforced ACROSS
+// both endpoints — opening 1 tutorial-level + 1 per-chapter stream consumes
+// 2 of the 2-slot quota. Conservative; the alternative (per-route caps) is
+// gameable by mixing endpoint types.
 //
-// Policy: max 2 concurrent open SSE connections per session. 3rd open
-// returns 429 with Retry-After. Same shape as noor's ingest rate-limit
-// (per-user Map), but here the metric is "currently-open connections" not
-// "operations per window".
-//
-// Bounded growth: the Map only holds counts for sessions that currently
-// HAVE open connections. Decrement-on-close brings the count to 0 and we
-// delete the key. Worst case is one entry per concurrently-streaming user.
+// Acquired in the route handler below, released in the ReadableStream's
+// cancel + done paths via the `releaseSlot` import.
 
-const MAX_CONCURRENT_STREAMS_PER_USER = 2;
-
-const concurrentStreams = new Map<string, number>();
-
-function tryAcquireStreamSlot(userId: string): boolean {
-  const current = concurrentStreams.get(userId) ?? 0;
-  if (current >= MAX_CONCURRENT_STREAMS_PER_USER) {
-    return false;
-  }
-  concurrentStreams.set(userId, current + 1);
-  return true;
-}
-
-function releaseStreamSlot(userId: string): void {
-  const current = concurrentStreams.get(userId) ?? 0;
-  if (current <= 1) {
-    concurrentStreams.delete(userId); // bounded growth: drop on zero
-  } else {
-    concurrentStreams.set(userId, current - 1);
-  }
-}
+import {
+  tryAcquireSlot as tryAcquireStreamSlot,
+  releaseSlot as releaseStreamSlot,
+} from '@/lib/streaming-slots';
 
 // ───────────────────────────────────────────────────────────────────────────
 // Public types — the SSE wire contract with the UI (casey)

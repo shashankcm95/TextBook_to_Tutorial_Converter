@@ -25,6 +25,7 @@
 //     selection" — pick the cheapest model that solves the problem.
 
 import { openai } from '@/lib/openai/client';
+import { withRetry } from '@/lib/openai/_retry';
 import type { SourceParagraph } from '@/lib/types';
 import { formatRef } from '@/lib/pdf/paragraph-anchors';
 import type { GlossarySection } from './chunker';
@@ -92,15 +93,22 @@ export async function extractGlossaryFromSections(
 
   let raw = '';
   try {
-    const response = await openai.chat.completions.create({
-      model: EXTRACT_MODEL,
-      messages: [
-        { role: 'system', content: SYSTEM_PROMPT },
-        { role: 'user', content: userPrompt },
-      ],
-      response_format: { type: 'json_object' },
-      max_tokens: 4096,
-      temperature: 0,
+    // DRIFT-test3-032: wrap in shared retry. Fail-open semantics preserved
+    // (the catch still returns empty terms) but transient 429s get 3
+    // attempts before the empty-glossary fallback fires.
+    const response = await withRetry({
+      operationName: 'glossary-extract',
+      fn: async () =>
+        openai.chat.completions.create({
+          model: EXTRACT_MODEL,
+          messages: [
+            { role: 'system', content: SYSTEM_PROMPT },
+            { role: 'user', content: userPrompt },
+          ],
+          response_format: { type: 'json_object' },
+          max_tokens: 4096,
+          temperature: 0,
+        }),
     });
     raw = response.choices[0]?.message?.content ?? '';
   } catch (err) {

@@ -30,6 +30,7 @@ import { tutorials, chapters } from '@/db/schema';
 import { verifySession, SESSION_COOKIE_NAME } from '@/lib/session';
 import { generateChapter, ChapterGenerationError } from '@/lib/generation/per-chapter';
 import { resolveChunksBucket, readChunk } from '@/lib/s3-chunks';
+import { tryAcquireSlot, releaseSlot } from '@/lib/streaming-slots';
 import type { SourceParagraph } from '@/lib/types';
 
 export const runtime = 'nodejs';
@@ -98,7 +99,34 @@ export async function GET(
   // populate the citation index immediately, before tokens arrive).
   const sourceParagraphs = await loadSourceParagraphs(chapter, tutorial);
 
-  // ── 4. Open SSE stream ──────────────────────────────────────────────
+  // ── 4. Acquire concurrent-stream slot (DRIFT-test3-033) ──────────────
+  // The per-chapter route was previously uncapped; only the legacy tutorial-
+  // level stream enforced this. After DRIFT-019 made the per-chapter route
+  // the production UI path, an authenticated user with N tabs could fire N
+  // parallel generations against the SAME tutorial, bypassing the cost-cap
+  // (which is per-tutorial) and multiplying server cost. The shared
+  // streaming-slots module now caps both routes together.
+  //
+  // Released in BOTH the ReadableStream's start() finally block AND the
+  // cancel() path. Acquired AFTER ownership check (above) so a foreign-
+  // tutorial probe doesn't consume a slot the legitimate session could use.
+  if (!tryAcquireSlot(userId)) {
+    return new Response(
+      JSON.stringify({
+        error: 'too many concurrent streams',
+        message: 'Close some open chapter tabs and try again.',
+      }),
+      {
+        status: 429,
+        headers: {
+          'Content-Type': 'application/json',
+          'Retry-After': '5',
+        },
+      },
+    );
+  }
+
+  // ── 5. Open SSE stream ──────────────────────────────────────────────
   const encoder = new TextEncoder();
   const abort = new AbortController();
   req.signal?.addEventListener('abort', () => abort.abort(), { once: true });
@@ -158,10 +186,20 @@ export async function GET(
         }
       } finally {
         controller.close();
+        // Release the slot on the success / error completion path. Paired
+        // with the cancel() handler below — both must release (whichever
+        // fires first deletes the count; the other becomes a no-op via
+        // releaseSlot's clamp-at-zero idempotency).
+        releaseSlot(userId);
       }
     },
     cancel() {
       abort.abort();
+      // Client disconnected (tab close, navigation, EventSource.close()).
+      // The start() body's finally will also fire (controller.close + this
+      // releaseSlot), but cancel() fires first; releaseSlot is idempotent
+      // so a double-release is safely a no-op.
+      releaseSlot(userId);
     },
   });
 

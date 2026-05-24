@@ -19,6 +19,7 @@
 
 import { openai } from './client';
 import { actualCost, isSupportedModel, UnknownModelError } from './cost';
+import { withRetry } from './_retry';
 import {
   buildNarrativeOnlySystemPrompt,
   buildNarrativeOnlyUserPrompt,
@@ -61,60 +62,73 @@ export async function generateNarrativeOnly(
   const systemPrompt = buildNarrativeOnlySystemPrompt();
   const userPrompt = buildNarrativeOnlyUserPrompt({ chapterTitle, sourceParagraphs });
 
-  const stream = await openai.chat.completions.create(
-    {
-      model: MODEL,
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt },
-      ],
-      response_format: NARRATIVE_ONLY_RESPONSE_FORMAT,
-      stream: true,
-      stream_options: { include_usage: true },
-      max_tokens: MAX_COMPLETION_TOKENS,
-      temperature: 0.3,
+  // DRIFT-test3-032: wrap in shared retry policy. Without this, a single 429
+  // from OpenAI marked the chapter `failed`, threw away the prompt tokens,
+  // and surfaced a dead chapter to the user. The retry policy honors abort
+  // cooperatively; NarrativeParseError is recognized as parse-retryable so a
+  // transient bad-JSON streams gets ONE retry (attempt index >0) with no
+  // backoff. Caller (per-chapter.ts) is unchanged otherwise.
+  return withRetry({
+    operationName: 'narrative-only',
+    abortSignal,
+    isParseError: (err) => err instanceof NarrativeParseError,
+    fn: async () => {
+      const stream = await openai.chat.completions.create(
+        {
+          model: MODEL,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt },
+          ],
+          response_format: NARRATIVE_ONLY_RESPONSE_FORMAT,
+          stream: true,
+          stream_options: { include_usage: true },
+          max_tokens: MAX_COMPLETION_TOKENS,
+          temperature: 0.3,
+        },
+        { signal: abortSignal },
+      );
+
+      let accumulated = '';
+      let promptTokens = 0;
+      let completionTokens = 0;
+      for await (const chunk of stream) {
+        if (abortSignal?.aborted) throw new Error('aborted');
+        const delta = chunk.choices[0]?.delta?.content;
+        if (typeof delta === 'string' && delta.length > 0) {
+          accumulated += delta;
+          onToken(delta);
+        }
+        if (chunk.usage) {
+          promptTokens = chunk.usage.prompt_tokens;
+          completionTokens = chunk.usage.completion_tokens;
+        }
+      }
+
+      // Parse the strict-mode JSON output and extract narrative field.
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(accumulated);
+      } catch (err) {
+        throw new NarrativeParseError(
+          `JSON.parse failed: ${(err as Error).message}`,
+          accumulated,
+        );
+      }
+      if (!isObjectWithNarrative(parsed)) {
+        throw new NarrativeParseError('response missing narrative field', accumulated);
+      }
+
+      const costUsd = actualCost({ model: MODEL, promptTokens, completionTokens });
+      return {
+        narrative: parsed.narrative,
+        promptTokens,
+        completionTokens,
+        costUsd,
+        model: MODEL,
+      };
     },
-    { signal: abortSignal },
-  );
-
-  let accumulated = '';
-  let promptTokens = 0;
-  let completionTokens = 0;
-  for await (const chunk of stream) {
-    if (abortSignal?.aborted) throw new Error('aborted');
-    const delta = chunk.choices[0]?.delta?.content;
-    if (typeof delta === 'string' && delta.length > 0) {
-      accumulated += delta;
-      onToken(delta);
-    }
-    if (chunk.usage) {
-      promptTokens = chunk.usage.prompt_tokens;
-      completionTokens = chunk.usage.completion_tokens;
-    }
-  }
-
-  // Parse the strict-mode JSON output and extract narrative field.
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(accumulated);
-  } catch (err) {
-    throw new NarrativeParseError(
-      `JSON.parse failed: ${(err as Error).message}`,
-      accumulated,
-    );
-  }
-  if (!isObjectWithNarrative(parsed)) {
-    throw new NarrativeParseError('response missing narrative field', accumulated);
-  }
-
-  const costUsd = actualCost({ model: MODEL, promptTokens, completionTokens });
-  return {
-    narrative: parsed.narrative,
-    promptTokens,
-    completionTokens,
-    costUsd,
-    model: MODEL,
-  };
+  });
 }
 
 function isObjectWithNarrative(x: unknown): x is { narrative: string } {

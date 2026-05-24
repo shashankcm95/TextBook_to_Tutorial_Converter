@@ -47,6 +47,7 @@ import {
   UnknownModelError,
 } from './cost';
 import { assertCostBudget } from './cost-cap';
+import { withRetry, abortError } from './_retry';
 import {
   CHAPTER_GEN_RESPONSE_FORMAT,
   buildChapterGenSystemPrompt,
@@ -115,16 +116,12 @@ export class ChapterGenParseError extends Error {
  */
 const MAX_COMPLETION_TOKENS = 4096;
 
-/** Backoff schedules per error class. Times are in milliseconds.
- *  429 budget: 1s, 2s, 4s with ±25% jitter — total worst-case ≈ 7s wait.
- *  5xx budget: 10s, 30s — total worst-case ≈ 40s wait.
- *  parse:      single retry with stricter prompt addendum.
- */
-const RETRY_BACKOFF_MS = {
-  rateLimit: [1_000, 2_000, 4_000],
-  serverError: [10_000, 30_000],
-  parseError: [0], // immediate retry with stricter prompt
-} as const;
+// Retry policy moved to src/lib/openai/_retry.ts as part of DRIFT-test3-032.
+// The shared module unifies retry behavior across:
+//   - streaming.ts (this file)
+//   - narrative-only.ts + quiz-from-narrative.ts + fidelity-check.ts
+//   - ingest/classifier.ts + ingest/glossary-extract.ts
+// See withRetry() call in generateChapterStreaming below.
 
 // ───────────────────────────────────────────────────────────────────────────
 // Implementation
@@ -160,20 +157,22 @@ export async function generateChapterStreaming(
   );
 
   // ── The actual streaming call, with retry on 429/5xx/parse ──
-  // Each attempt is wrapped to surface the right error class to the loop.
-  let lastError: unknown = null;
-  for (let attempt = 0; attempt < maxAttempts(); attempt++) {
-    // Cooperative abort: check before each attempt so a fast disconnect
-    // doesn't waste a retry slot.
-    if (abortSignal?.aborted) {
-      throw abortError(abortSignal);
-    }
-    try {
-      // nova CRITICAL-2 (test3 Phase 3) refactor: destructure both rawText
-      // and usage directly from streamOnce. The previous design smuggled
-      // usage via a module-global Map keyed on accumulated content — leaked
-      // on AbortError, vulnerable to string-key collision under concurrent
-      // streaming from distinct tutorials producing identical output.
+  //
+  // Refactored DRIFT-test3-032: retry plumbing now lives in
+  // src/lib/openai/_retry.ts and is shared with narrative-only,
+  // quiz-from-narrative, fidelity-check, classifier, glossary-extract.
+  // Semantics preserved: 429 → rateLimit backoff with jitter, 5xx →
+  // serverError backoff, ChapterGenParseError → parseError backoff (one
+  // immediate retry with stricter prompt). 4xx-other / network / abort →
+  // surface immediately.
+  return withRetry({
+    operationName: 'chapter-streaming',
+    abortSignal,
+    isParseError: (err) => err instanceof ChapterGenParseError,
+    fn: async (attempt) => {
+      // nova CRITICAL-2 (test3 Phase 3) refactor preserved: destructure both
+      // rawText and usage directly from streamOnce. The previous design
+      // smuggled usage via a module-global Map keyed on accumulated content.
       const { rawText, usage } = await streamOnce({
         model,
         systemPrompt,
@@ -183,14 +182,10 @@ export async function generateChapterStreaming(
         attempt,
       });
       // Parse + validate. On JSON-parse failure we throw a recoverable
-      // ChapterGenParseError that the retry loop catches and treats as a
-      // parseError class. parseAndValidate is now a PURE function (no
-      // module-global lookup) — see nova CRITICAL-2 refactor above.
+      // ChapterGenParseError that withRetry's isParseError predicate
+      // classifies as parse-retryable.
       const parsed = parseAndValidate(rawText, validRefs);
       // ── Post-call: account actual usage from the (final) stream chunk ──
-      // The streaming API returns usage in the final chunk if stream_options
-      // includes_usage; streamOnce destructures it out and returns it as
-      // part of the StreamOnceResult tuple.
       const { promptTokens, completionTokens } = usage;
       const costUsd = actualCost({ model, promptTokens, completionTokens });
       return {
@@ -201,23 +196,8 @@ export async function generateChapterStreaming(
         validationDropCount: parsed.validationDropCount,
         model,
       };
-    } catch (err: unknown) {
-      lastError = err;
-      if (isAbortError(err) || abortSignal?.aborted) {
-        // Abort propagated from caller — do NOT retry; surface to caller.
-        throw err;
-      }
-      const retryDelay = computeRetryDelay(err, attempt);
-      if (retryDelay === null) {
-        // Non-retryable (4xx other than 429, or out of retries).
-        throw err;
-      }
-      await sleep(retryDelay, abortSignal);
-    }
-  }
-  // Loop fell through (shouldn't happen — computeRetryDelay enforces the
-  // cap — but TypeScript wants the unreachable branch).
-  throw lastError ?? new Error('generateChapterStreaming: exhausted retries');
+    },
+  });
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -395,100 +375,6 @@ function isObject(x: unknown): x is Record<string, unknown> {
   return typeof x === 'object' && x !== null && !Array.isArray(x);
 }
 
-// ───────────────────────────────────────────────────────────────────────────
-// Internal: retry classification + backoff math
-// ───────────────────────────────────────────────────────────────────────────
-
-function maxAttempts(): number {
-  // Sum across all retry classes + 1 for the initial attempt.
-  return (
-    1 +
-    RETRY_BACKOFF_MS.rateLimit.length +
-    RETRY_BACKOFF_MS.serverError.length +
-    RETRY_BACKOFF_MS.parseError.length
-  );
-}
-
-/**
- * Returns the backoff delay (ms) to wait before the next attempt, or null
- * if the error is non-retryable / retries are exhausted.
- *
- * Classification:
- *   - HTTP 429 (rate limit) → consume from RETRY_BACKOFF_MS.rateLimit with jitter
- *   - HTTP 5xx              → consume from RETRY_BACKOFF_MS.serverError
- *   - ChapterGenParseError  → consume from RETRY_BACKOFF_MS.parseError
- *   - Anything else (4xx, network) → null (non-retryable)
- *
- * Per-error counters are passed via the `attempt` index by walking the
- * arrays in order. NOTE: a sequence of 429,5xx,429 will consume from each
- * array in order; we don't track per-class attempt counts separately (would
- * require carrying state across the loop). MVP behavior: total retries
- * across all classes is bounded by maxAttempts(). See finding MEDIUM-2.
- */
-function computeRetryDelay(err: unknown, attempt: number): number | null {
-  if (err instanceof ChapterGenParseError) {
-    return RETRY_BACKOFF_MS.parseError[Math.min(attempt, RETRY_BACKOFF_MS.parseError.length - 1)] ?? null;
-  }
-  const status = extractStatus(err);
-  if (status === 429) {
-    const base = RETRY_BACKOFF_MS.rateLimit[Math.min(attempt, RETRY_BACKOFF_MS.rateLimit.length - 1)];
-    return base === undefined ? null : jitter(base);
-  }
-  if (status !== null && status >= 500 && status < 600) {
-    const base = RETRY_BACKOFF_MS.serverError[Math.min(attempt, RETRY_BACKOFF_MS.serverError.length - 1)];
-    return base ?? null;
-  }
-  return null;
-}
-
-function extractStatus(err: unknown): number | null {
-  if (typeof err === 'object' && err !== null && 'status' in err) {
-    const s = (err as { status: unknown }).status;
-    if (typeof s === 'number') return s;
-  }
-  return null;
-}
-
-/** ±25% jitter. Math.random() OK here — not security-sensitive. */
-function jitter(baseMs: number): number {
-  const variance = baseMs * 0.25;
-  return Math.max(0, baseMs + (Math.random() * 2 - 1) * variance);
-}
-
-// ───────────────────────────────────────────────────────────────────────────
-// Internal: abort plumbing
-// ───────────────────────────────────────────────────────────────────────────
-
-function isAbortError(err: unknown): boolean {
-  if (typeof err !== 'object' || err === null) return false;
-  const e = err as { name?: unknown; code?: unknown };
-  return e.name === 'AbortError' || e.code === 'ERR_ABORTED';
-}
-
-function abortError(signal: AbortSignal): Error {
-  // Prefer the reason if provided (Node 20+ supports AbortSignal.reason).
-  const reason = (signal as AbortSignal & { reason?: unknown }).reason;
-  if (reason instanceof Error) return reason;
-  const err = new Error('chapter generation aborted by caller');
-  err.name = 'AbortError';
-  return err;
-}
-
-/** Sleep that respects AbortSignal. Resolves on timeout or rejects on abort. */
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) {
-      reject(abortError(signal));
-      return;
-    }
-    const t = setTimeout(() => {
-      signal?.removeEventListener('abort', onAbort);
-      resolve();
-    }, ms);
-    const onAbort = () => {
-      clearTimeout(t);
-      reject(abortError(signal!));
-    };
-    signal?.addEventListener('abort', onAbort, { once: true });
-  });
-}
+// Retry classifier + backoff math + abort plumbing moved to ./_retry.ts
+// as part of DRIFT-test3-032. The shared module is the single source of
+// truth across all OpenAI call sites in this codebase.

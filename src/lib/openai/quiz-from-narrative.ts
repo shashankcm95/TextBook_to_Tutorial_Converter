@@ -16,6 +16,7 @@
 
 import { openai } from './client';
 import { actualCost } from './cost';
+import { withRetry } from './_retry';
 import {
   buildQuizFromNarrativeSystemPrompt,
   buildQuizFromNarrativeUserPrompt,
@@ -63,64 +64,75 @@ export async function generateQuizFromNarrative(
     sourceParagraphs,
   });
 
-  const response = await openai.chat.completions.create(
-    {
-      model: MODEL,
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt },
-      ],
-      response_format: QUIZ_FROM_NARRATIVE_RESPONSE_FORMAT,
-      max_tokens: MAX_COMPLETION_TOKENS,
-      temperature: 0.2,
+  // DRIFT-test3-032: wrap in shared retry policy. Closes the regression
+  // where a single 429 mid-quiz-derivation killed the chapter even after
+  // the (expensive) narrative call succeeded. QuizParseError is recognized
+  // as parse-retryable so an occasional bad-JSON gets one fresh attempt.
+  return withRetry({
+    operationName: 'quiz-from-narrative',
+    abortSignal,
+    isParseError: (err) => err instanceof QuizParseError,
+    fn: async () => {
+      const response = await openai.chat.completions.create(
+        {
+          model: MODEL,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt },
+          ],
+          response_format: QUIZ_FROM_NARRATIVE_RESPONSE_FORMAT,
+          max_tokens: MAX_COMPLETION_TOKENS,
+          temperature: 0.2,
+        },
+        { signal: abortSignal },
+      );
+
+      const text = response.choices[0]?.message?.content ?? '';
+      const promptTokens = response.usage?.prompt_tokens ?? 0;
+      const completionTokens = response.usage?.completion_tokens ?? 0;
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(text);
+      } catch (err) {
+        throw new QuizParseError(`JSON.parse failed: ${(err as Error).message}`, text);
+      }
+
+      if (!isObject(parsed)) throw new QuizParseError('response is not an object', text);
+      const rawQ = Array.isArray(parsed.questions) ? (parsed.questions as QuizQuestion[]) : [];
+      const rawF = Array.isArray(parsed.flashcards) ? (parsed.flashcards as LLMFlashcard[]) : [];
+
+      // Validate refs; drop invalids; count drops.
+      let droppedCount = 0;
+      const questions: QuizQuestion[] = [];
+      for (const q of rawQ) {
+        if (typeof q.sourceParagraphRef === 'string' && validateRef(q.sourceParagraphRef, sourceParagraphs)) {
+          questions.push(q);
+        } else {
+          droppedCount++;
+        }
+      }
+      const flashcards: LLMFlashcard[] = [];
+      for (const f of rawF) {
+        if (typeof f.sourceParagraphRef === 'string' && validateRef(f.sourceParagraphRef, sourceParagraphs)) {
+          flashcards.push(f);
+        } else {
+          droppedCount++;
+        }
+      }
+
+      const costUsd = actualCost({ model: MODEL, promptTokens, completionTokens });
+      return {
+        questions,
+        flashcards,
+        validationDropCount: droppedCount,
+        promptTokens,
+        completionTokens,
+        costUsd,
+        model: MODEL,
+      };
     },
-    { signal: abortSignal },
-  );
-
-  const text = response.choices[0]?.message?.content ?? '';
-  const promptTokens = response.usage?.prompt_tokens ?? 0;
-  const completionTokens = response.usage?.completion_tokens ?? 0;
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch (err) {
-    throw new QuizParseError(`JSON.parse failed: ${(err as Error).message}`, text);
-  }
-
-  if (!isObject(parsed)) throw new QuizParseError('response is not an object', text);
-  const rawQ = Array.isArray(parsed.questions) ? (parsed.questions as QuizQuestion[]) : [];
-  const rawF = Array.isArray(parsed.flashcards) ? (parsed.flashcards as LLMFlashcard[]) : [];
-
-  // Validate refs; drop invalids; count drops.
-  let droppedCount = 0;
-  const questions: QuizQuestion[] = [];
-  for (const q of rawQ) {
-    if (typeof q.sourceParagraphRef === 'string' && validateRef(q.sourceParagraphRef, sourceParagraphs)) {
-      questions.push(q);
-    } else {
-      droppedCount++;
-    }
-  }
-  const flashcards: LLMFlashcard[] = [];
-  for (const f of rawF) {
-    if (typeof f.sourceParagraphRef === 'string' && validateRef(f.sourceParagraphRef, sourceParagraphs)) {
-      flashcards.push(f);
-    } else {
-      droppedCount++;
-    }
-  }
-
-  const costUsd = actualCost({ model: MODEL, promptTokens, completionTokens });
-  return {
-    questions,
-    flashcards,
-    validationDropCount: droppedCount,
-    promptTokens,
-    completionTokens,
-    costUsd,
-    model: MODEL,
-  };
+  });
 }
 
 function isObject(x: unknown): x is Record<string, unknown> {

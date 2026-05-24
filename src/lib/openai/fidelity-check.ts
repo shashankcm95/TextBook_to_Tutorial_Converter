@@ -17,6 +17,7 @@
 
 import { openai } from './client';
 import { actualCost } from './cost';
+import { withRetry } from './_retry';
 import type { SourceParagraph } from '@/lib/types';
 
 const MODEL = 'gpt-4o-mini';
@@ -155,49 +156,61 @@ export async function scoreFidelity(args: FidelityCheckArgs): Promise<FidelityCh
     'Score the fidelity now.',
   ].join('\n');
 
-  const response = await openai.chat.completions.create(
-    {
-      model: MODEL,
-      messages: [
-        { role: 'system', content: SYSTEM_PROMPT },
-        { role: 'user', content: userPrompt },
-      ],
-      response_format: RESPONSE_FORMAT,
-      max_tokens: MAX_COMPLETION_TOKENS,
-      temperature: 0,
+  // DRIFT-test3-032: wrap in shared retry. Caller (per-chapter.ts) keeps
+  // fail-open semantics — if all retries exhaust, the FidelityCheckError
+  // propagates and per-chapter.ts swallows it (score=null is logged as
+  // 'unknown' rather than blocking the read path). The retry just gives
+  // transient 429s a chance to succeed before falling back to fail-open.
+  return withRetry({
+    operationName: 'fidelity-check',
+    abortSignal,
+    isParseError: (err) => err instanceof FidelityCheckError,
+    fn: async () => {
+      const response = await openai.chat.completions.create(
+        {
+          model: MODEL,
+          messages: [
+            { role: 'system', content: SYSTEM_PROMPT },
+            { role: 'user', content: userPrompt },
+          ],
+          response_format: RESPONSE_FORMAT,
+          max_tokens: MAX_COMPLETION_TOKENS,
+          temperature: 0,
+        },
+        { signal: abortSignal },
+      );
+
+      const text = response.choices[0]?.message?.content ?? '';
+      const promptTokens = response.usage?.prompt_tokens ?? 0;
+      const completionTokens = response.usage?.completion_tokens ?? 0;
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(text);
+      } catch (err) {
+        throw new FidelityCheckError(`JSON.parse failed: ${(err as Error).message}`, text);
+      }
+      if (!isFidelityShape(parsed)) {
+        throw new FidelityCheckError('response did not match fidelity schema', text);
+      }
+
+      const costUsd = actualCost({ model: MODEL, promptTokens, completionTokens });
+      return {
+        specificNumbersPreserved: parsed.specific_numbers_preserved,
+        namedExamplesPreserved: parsed.named_examples_preserved,
+        terminologicalContrastsPreserved: parsed.terminological_contrasts_preserved,
+        specificNumbersMissing: parsed.specific_numbers_missing,
+        namedExamplesMissing: parsed.named_examples_missing,
+        terminologicalContrastsMissing: parsed.terminological_contrasts_missing,
+        overallScore: parsed.overall_score,
+        notes: parsed.notes,
+        promptTokens,
+        completionTokens,
+        costUsd,
+        model: MODEL,
+      };
     },
-    { signal: abortSignal },
-  );
-
-  const text = response.choices[0]?.message?.content ?? '';
-  const promptTokens = response.usage?.prompt_tokens ?? 0;
-  const completionTokens = response.usage?.completion_tokens ?? 0;
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch (err) {
-    throw new FidelityCheckError(`JSON.parse failed: ${(err as Error).message}`, text);
-  }
-  if (!isFidelityShape(parsed)) {
-    throw new FidelityCheckError('response did not match fidelity schema', text);
-  }
-
-  const costUsd = actualCost({ model: MODEL, promptTokens, completionTokens });
-  return {
-    specificNumbersPreserved: parsed.specific_numbers_preserved,
-    namedExamplesPreserved: parsed.named_examples_preserved,
-    terminologicalContrastsPreserved: parsed.terminological_contrasts_preserved,
-    specificNumbersMissing: parsed.specific_numbers_missing,
-    namedExamplesMissing: parsed.named_examples_missing,
-    terminologicalContrastsMissing: parsed.terminological_contrasts_missing,
-    overallScore: parsed.overall_score,
-    notes: parsed.notes,
-    promptTokens,
-    completionTokens,
-    costUsd,
-    model: MODEL,
-  };
+  });
 }
 
 function isFidelityShape(x: unknown): x is {
