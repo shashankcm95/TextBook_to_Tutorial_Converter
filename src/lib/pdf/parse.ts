@@ -37,6 +37,7 @@
 import { getDocument, GlobalWorkerOptions } from 'pdfjs-dist/legacy/build/pdf.mjs';
 import { join } from 'node:path';
 import type { SourceParagraph } from '@/lib/types';
+import { isMonospaceFontFamily, classifyParagraphKind } from './font-class';
 
 // pdfjs-dist 4.x requires a worker file path even on Node — the legacy build
 // uses a "fake worker" that runs on the main thread, but the spin-up code
@@ -198,27 +199,67 @@ async function extractPage(pdfDoc: any, pageNumber: number): Promise<ParsedPage>
     throw new PdfParseError(`getTextContent(${pageNumber}) failed: ${(err as Error).message}`, err);
   }
 
-  const items: Array<{ str: string; hasEOL?: boolean }> = content.items;
+  return extractPageFromContent(
+    pageNumber,
+    content.items ?? [],
+    content.styles ?? {},
+  );
+}
 
-  // Strategy 1: group by hasEOL boundaries
-  const paragraphsByEOL = groupParagraphsByEOL(items);
-  const rawText = items.map((i) => i.str).join('');
+/**
+ * Pure variant of extractPage: takes raw pdfjs items + styles map (no
+ * pdfDoc/page side effects) and returns the ParsedPage. Exported for unit
+ * testing — production code should call extractPage with a real pdfDoc.
+ *
+ * PR-B: resolves per-item monospace flag from styles[fontName].fontFamily,
+ * then emits each paragraph with its kind classification. Items missing
+ * fontName, missing style entry, or with no fontFamily default to
+ * non-monospace (fail-open).
+ */
+export function extractPageFromContent(
+  pageNumber: number,
+  items: ReadonlyArray<PdfTextItem>,
+  styles: Readonly<Record<string, { fontFamily?: string }>>,
+): ParsedPage {
+  const enriched: EnrichedItem[] = items.map((it) => {
+    const fontName = it.fontName ?? '';
+    const fontFamily = fontName ? styles[fontName]?.fontFamily ?? null : null;
+    return {
+      str: it.str ?? '',
+      hasEOL: !!it.hasEOL,
+      isMonospace: isMonospaceFontFamily(fontFamily),
+    };
+  });
+
+  // Strategy 1: group by hasEOL boundaries — both string + monospace flags
+  const paragraphsByEOL = groupParagraphsByEOL(enriched);
+  const rawText = enriched.map((i) => i.str).join('');
 
   let paragraphs: SourceParagraph[];
   if (paragraphsByEOL.length >= 2) {
-    paragraphs = paragraphsByEOL.map((text, idx) => ({
+    paragraphs = paragraphsByEOL.map((group, idx) => ({
       page: pageNumber,
       paragraphIdx: idx,
-      text,
+      text: group.text,
+      kind: classifyParagraphKind(group.items),
     }));
   } else {
-    // Strategy 2 fallback: split rawText on blank-line runs
+    // Strategy 2 fallback: split rawText on blank-line runs. We've lost
+    // per-item font info at this point, so default to 'prose' (fail-open).
     const splits = rawText.split(/\n{2,}/).map((s) => s.trim()).filter((s) => s.length > 0);
     if (splits.length > 0) {
-      paragraphs = splits.map((text, idx) => ({ page: pageNumber, paragraphIdx: idx, text }));
+      paragraphs = splits.map((text, idx) => ({
+        page: pageNumber,
+        paragraphIdx: idx,
+        text,
+        kind: 'prose' as const,
+      }));
     } else if (rawText.trim().length > 0) {
-      // Strategy 3 last-resort: one paragraph for the whole page
-      paragraphs = [{ page: pageNumber, paragraphIdx: 0, text: rawText.trim() }];
+      // Strategy 3 last-resort: one paragraph for the whole page. Same
+      // fail-open default. Page-level mono ratio could be applied here
+      // as a coarser signal, but Strategy 3 fires on degenerate inputs
+      // (no EOLs, no blank lines) where any classification is suspect.
+      paragraphs = [{ page: pageNumber, paragraphIdx: 0, text: rawText.trim(), kind: 'prose' }];
     } else {
       paragraphs = [];
     }
@@ -226,6 +267,25 @@ async function extractPage(pdfDoc: any, pageNumber: number): Promise<ParsedPage>
 
   return { pageNumber, rawText, paragraphs };
 }
+
+/** Raw pdfjs text item. Field set is a subset of the pdfjs API. */
+type PdfTextItem = { str?: string; hasEOL?: boolean; fontName?: string };
+
+/**
+ * Item enriched with the monospace flag derived from styles[fontName].
+ * Internal-only — the public SourceParagraph carries only the per-paragraph
+ * `kind` distillation, not the per-item flags.
+ */
+type EnrichedItem = { str: string; hasEOL: boolean; isMonospace: boolean };
+
+/**
+ * One paragraph emitted by the EOL grouper: its text + the per-item flags
+ * that contributed to it. The flags feed the PR-B monospace classifier.
+ */
+type ParagraphGroup = {
+  text: string;
+  items: Array<{ str: string; isMonospace: boolean }>;
+};
 
 /**
  * Group pdfjs items into paragraphs by EOL run.
@@ -236,30 +296,41 @@ async function extractPage(pdfDoc: any, pageNumber: number): Promise<ParsedPage>
  *   - When TWO consecutive items have hasEOL=true (with no non-empty
  *     content between), the current paragraph closes and a new one begins.
  *
- * Returns an array of paragraph strings (trimmed; empties filtered).
+ * Returns ParagraphGroup[] — each carries both the concatenated text and
+ * the per-item (str, isMonospace) tuples so callers can derive paragraph-
+ * level signal (PR-B paragraph kind classification, etc.).
  */
-function groupParagraphsByEOL(items: Array<{ str: string; hasEOL?: boolean }>): string[] {
-  const paragraphs: string[] = [];
-  let current = '';
+function groupParagraphsByEOL(items: ReadonlyArray<EnrichedItem>): ParagraphGroup[] {
+  const paragraphs: ParagraphGroup[] = [];
+  let currentText = '';
+  let currentItems: ParagraphGroup['items'] = [];
   let prevWasEOL = false;
   for (const item of items) {
     const str = item.str ?? '';
     if (item.hasEOL) {
-      if (prevWasEOL && current.trim().length > 0) {
+      if (prevWasEOL && currentText.trim().length > 0) {
         // paragraph break
-        paragraphs.push(current.trim());
-        current = '';
+        paragraphs.push({ text: currentText.trim(), items: currentItems });
+        currentText = '';
+        currentItems = [];
       }
       // single EOL: collapse to space for in-paragraph wrap
-      current += str + ' ';
+      currentText += str + ' ';
+      // Preserve the item itself + a single-char space stand-in (str+' ')
+      // for ratio bookkeeping; computeMonospaceRatio trims whitespace, so
+      // the trailing space doesn't skew either way.
+      if (str.length > 0) currentItems.push({ str, isMonospace: item.isMonospace });
       prevWasEOL = true;
     } else {
-      current += str;
+      currentText += str;
+      if (str.length > 0) currentItems.push({ str, isMonospace: item.isMonospace });
       prevWasEOL = false;
     }
   }
-  if (current.trim().length > 0) paragraphs.push(current.trim());
-  return paragraphs.filter((p) => p.length > 0);
+  if (currentText.trim().length > 0) {
+    paragraphs.push({ text: currentText.trim(), items: currentItems });
+  }
+  return paragraphs.filter((p) => p.text.length > 0);
 }
 
 /**

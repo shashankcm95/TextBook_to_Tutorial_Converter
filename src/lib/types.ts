@@ -50,6 +50,19 @@ export type SourceParagraph = {
   paragraphIdx: number;
   text: string;
   chapterParagraphIdx?: number;
+  /**
+   * PR-B: paragraph typography classification derived from pdfjs font
+   * metadata. 'code' iff a configurable majority of the paragraph's
+   * non-whitespace characters render in a known monospace font family
+   * (see src/lib/pdf/font-class.ts). The narrative prompt uses this to
+   * preserve code listings verbatim (FIDELITY rule 7 enforcement).
+   *
+   * Optional + additive: pre-PR-B source_paragraphs_json rows lack this
+   * field; consumers MUST treat absent as 'prose' (safe default — at worst
+   * the chapter loses the code-preservation hint and falls back to the
+   * prompt-level rule firing whenever the LLM detects code-like text).
+   */
+  kind?: 'prose' | 'code';
 };
 
 /**
