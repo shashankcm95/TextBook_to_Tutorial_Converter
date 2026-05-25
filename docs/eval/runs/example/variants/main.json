@@ -1,0 +1,8 @@
+{
+  "name": "main",
+  "tutorial_id": "REPLACE-WITH-REAL-TUTORIAL-UUID",
+  "chapter_range": [0, 5],
+  "env": {
+    "OPENAI_MODEL": "gpt-4o-mini"
+  }
+}

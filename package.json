@@ -17,7 +17,8 @@
     "db:migrate:status": "node scripts/db-migrate.js --status",
     "db:seed": "tsx src/db/seed.ts",
     "test": "vitest run",
-    "test:phase0": "bash scripts/phase0-gate.sh"
+    "test:phase0": "bash scripts/phase0-gate.sh",
+    "eval:run": "tsx scripts/ab-compare.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "3.621.0",
