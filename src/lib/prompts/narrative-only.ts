@@ -95,7 +95,7 @@ function baseSystemPromptLines(): string[] {
     '',
     '6. PRESERVE IMPLEMENTATION-SPECIFIC SEARCH-TERM ANCHORS. Technical books embed terms that a curious reader can later search to dig deeper: "head-of-line blocking", "tail-latency amplification", "t-digest", "HdrHistogram", "coordinated omission", "Chaos Monkey", named papers ("Out of the Tar Pit"), named protocols, named algorithms. KEEP THESE TERMS VERBATIM where the source uses them. Do NOT paraphrase a named technique into a generic description — that strips the reader\'s ability to follow citations into the wider literature.',
     '',
-    '7. PRESERVE CODE LISTINGS, ALGORITHMS, AND PSEUDO-CODE. When the source contains code (function signatures, algorithm pseudo-code, SQL queries, configuration snippets), REPRODUCE THE CODE in the narrative inside ```<language> fenced code blocks. The parser may have flattened line breaks into spaces — recognize code by syntactic signals: function declarations (function/def/fn), brace-pairs, semicolons at line ends, SELECT/FROM/WHERE keywords, indented blocks. When you detect code in the source, RECONSTRUCT it with proper formatting in the narrative. A textbook that shows a B-tree insertion algorithm and a tutorial that paraphrases it as "uses a B-tree structure" lose all teaching value — the algorithm IS the explanation. Inline code references (function names, type names, file paths) stay in `single backticks`.',
+    '7. PRESERVE CODE LISTINGS, ALGORITHMS, AND PSEUDO-CODE. When the source contains code (function signatures, algorithm pseudo-code, SQL queries, configuration snippets), REPRODUCE THE CODE in the narrative inside ```<language> fenced code blocks. PR-B: source paragraphs are now tagged with a `[CODE]` marker when the upstream parser detected a monospace font run (the typography signal pdfjs surfaces). When you see `[CODE]` between the page/paragraph key and the text, that paragraph IS code typographically — treat its content as a code listing even if a single line in isolation looks ambiguous; the multi-line code block is split across consecutive `[CODE]`-tagged paragraphs. Reconstruct the full block by concatenating adjacent `[CODE]` paragraphs and wrapping in a single fenced block. The parser may still miss code where the PDF lacked monospace metadata, so also recognize code by syntactic signals: function declarations (function/def/fn), brace-pairs, semicolons at line ends, SELECT/FROM/WHERE keywords, indented blocks. A textbook that shows a B-tree insertion algorithm and a tutorial that paraphrases it as "uses a B-tree structure" lose all teaching value — the algorithm IS the explanation. Inline code references (function names, type names, file paths) stay in `single backticks`.',
     '',
     '8. PRESERVE FIGURE REFERENCES. When the source contains "Figure X-Y" labels or descriptions of diagrams ("the diagram above shows...", "as illustrated in Figure 2-3"), REFERENCE THE FIGURE EXPLICITLY in the narrative ("Figure 2-3 shows...") AND describe what it depicts in prose so the reader who only reads the tutorial gets the figure\'s meaning. Name the specific components the figure illustrates: if Figure 1-1 shows a data system with cache + index + message queue + database, your narrative MUST mention cache + index + message queue + database by name. The reader\'s mental model is built from what survives into the tutorial — a dropped figure leaves a load-bearing absence. If a future pipeline extracts the actual image, the figure reference makes it embeddable later.',
     '',
@@ -261,13 +261,22 @@ export interface BuildNarrativeOnlyUserPromptArgs {
 
 export function buildNarrativeOnlyUserPrompt(args: BuildNarrativeOnlyUserPromptArgs): string {
   const { chapterTitle, sourceParagraphs } = args;
+  // PR-B: prepend [CODE] before the text of any paragraph whose typography
+  // the parser flagged as monospace (kind === 'code'). The marker is the
+  // signal FIDELITY rule 7 references — it lets the LLM treat a multi-line
+  // code listing as a single fenced block rather than paraphrasing it away.
+  // Pre-PR-B paragraphs (kind absent) format unchanged, preserving cache-hit
+  // narrative reproducibility for tutorials ingested before the parser change.
   const indexedParagraphs = sourceParagraphs
-    .map((p) => `[page${p.page}:paragraph${p.paragraphIdx}] ${p.text}`)
+    .map((p) => {
+      const marker = p.kind === 'code' ? '[CODE] ' : '';
+      return `[page${p.page}:paragraph${p.paragraphIdx}] ${marker}${p.text}`;
+    })
     .join('\n\n');
   return [
     `SECTION TITLE: ${chapterTitle}`,
     '',
-    'SOURCE PARAGRAPHS (cite these exact `page{N}:paragraph{M}` keys inline in the narrative):',
+    'SOURCE PARAGRAPHS (cite these exact `page{N}:paragraph{M}` keys inline in the narrative; paragraphs tagged `[CODE]` are monospace-font code listings — preserve them in fenced code blocks per FIDELITY rule 7):',
     '',
     indexedParagraphs,
     '',

@@ -23,10 +23,12 @@
 import { describe, it, expect } from 'vitest';
 import {
   buildNarrativeOnlySystemPrompt,
+  buildNarrativeOnlyUserPrompt,
   type BuildNarrativeOnlySystemPromptArgs,
 } from '../narrative-only';
 import type { VoiceProfile } from '@/lib/ingest/voice-extract';
 import type { AnchorWhitelistEntry } from '@/lib/openai/anchor-validator';
+import type { SourceParagraph } from '@/lib/types';
 
 // ───────────────────────────────────────────────────────────────────────────
 // Fixtures
@@ -373,5 +375,108 @@ describe('renderers — Wave-2 review HIGH 2B-H2 (defensive size caps)', () => {
     expect(prompt).toContain('anchor-term-30');
     expect(prompt).not.toContain('anchor-term-31');
     expect(prompt).not.toContain('anchor-term-45');
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// buildNarrativeOnlyUserPrompt — PR-B [CODE] marker
+// ───────────────────────────────────────────────────────────────────────────
+//
+// The user prompt is where each paragraph's text reaches the LLM. PR-B adds
+// a `[CODE]` marker prefix to paragraphs whose typography the parser
+// classified as monospace (kind === 'code'). Prose paragraphs are unchanged.
+// FIDELITY rule 7 in the SYSTEM prompt references the marker.
+
+function makeParagraph(overrides: Partial<SourceParagraph> = {}): SourceParagraph {
+  return {
+    page: 1,
+    paragraphIdx: 0,
+    text: 'sample paragraph text',
+    ...overrides,
+  };
+}
+
+describe('buildNarrativeOnlyUserPrompt — PR-B [CODE] marker', () => {
+  // Helper: slice the prompt to JUST the dumped paragraphs (skip the SOURCE
+  // PARAGRAPHS header which itself mentions `[CODE]` as documentation). The
+  // header ends at the first `[pageN:paragraphM]` token; everything from
+  // that token to "Generate the JSON narrative" is the paragraph dump.
+  function paragraphsBlock(prompt: string): string {
+    const firstParaIdx = prompt.search(/\[page\d+:paragraph\d+]/);
+    const generateIdx = prompt.indexOf('Generate the JSON narrative');
+    if (firstParaIdx < 0 || generateIdx < 0) return prompt;
+    return prompt.slice(firstParaIdx, generateIdx);
+  }
+
+  it('emits [CODE] prefix for kind="code" paragraphs', () => {
+    const sourceParagraphs: SourceParagraph[] = [
+      makeParagraph({ page: 1, paragraphIdx: 0, text: 'class Node { int v; }', kind: 'code' }),
+    ];
+    const prompt = buildNarrativeOnlyUserPrompt({
+      chapterTitle: 'Trees and Graphs',
+      sourceParagraphs,
+    });
+    expect(paragraphsBlock(prompt)).toContain('[page1:paragraph0] [CODE] class Node { int v; }');
+  });
+
+  it("does NOT emit [CODE] prefix for kind='prose' paragraphs", () => {
+    const sourceParagraphs: SourceParagraph[] = [
+      makeParagraph({ page: 1, paragraphIdx: 0, text: 'This chapter introduces trees.', kind: 'prose' }),
+    ];
+    const prompt = buildNarrativeOnlyUserPrompt({
+      chapterTitle: 'Trees',
+      sourceParagraphs,
+    });
+    const block = paragraphsBlock(prompt);
+    expect(block).toContain('[page1:paragraph0] This chapter introduces trees.');
+    expect(block).not.toContain('[CODE]');
+  });
+
+  it('does NOT emit [CODE] prefix when kind is absent (pre-PR-B back-compat)', () => {
+    // Pre-PR-B source_paragraphs_json rows lack the kind field entirely.
+    // Existing cached tutorials must keep their old prompt shape so cache
+    // hits don't reshape narratives unexpectedly.
+    const sourceParagraphs: SourceParagraph[] = [
+      makeParagraph({ page: 2, paragraphIdx: 3, text: 'Legacy paragraph text.' }),
+    ];
+    const prompt = buildNarrativeOnlyUserPrompt({
+      chapterTitle: 'Legacy',
+      sourceParagraphs,
+    });
+    const block = paragraphsBlock(prompt);
+    expect(block).toContain('[page2:paragraph3] Legacy paragraph text.');
+    expect(block).not.toContain('[CODE]');
+  });
+
+  it('mixes [CODE] and prose paragraphs correctly in document order', () => {
+    const sourceParagraphs: SourceParagraph[] = [
+      makeParagraph({ page: 1, paragraphIdx: 0, text: 'Intro prose.', kind: 'prose' }),
+      makeParagraph({ page: 1, paragraphIdx: 1, text: 'function f() {}', kind: 'code' }),
+      makeParagraph({ page: 1, paragraphIdx: 2, text: 'Closing prose.', kind: 'prose' }),
+    ];
+    const prompt = buildNarrativeOnlyUserPrompt({
+      chapterTitle: 'Mixed',
+      sourceParagraphs,
+    });
+    const block = paragraphsBlock(prompt);
+    expect(block).toContain('[page1:paragraph0] Intro prose.');
+    expect(block).toContain('[page1:paragraph1] [CODE] function f() {}');
+    expect(block).toContain('[page1:paragraph2] Closing prose.');
+    // Order preservation in the paragraphs block only
+    const introIdx = block.indexOf('Intro prose');
+    const codeIdx = block.indexOf('[CODE]');
+    const closingIdx = block.indexOf('Closing prose');
+    expect(introIdx).toBeGreaterThan(0);
+    expect(codeIdx).toBeGreaterThan(introIdx);
+    expect(closingIdx).toBeGreaterThan(codeIdx);
+  });
+
+  it('includes the [CODE]-marker explainer in the SOURCE PARAGRAPHS header', () => {
+    const prompt = buildNarrativeOnlyUserPrompt({
+      chapterTitle: 'Whatever',
+      sourceParagraphs: [makeParagraph()],
+    });
+    // The header must reference the marker so the LLM knows to act on it.
+    expect(prompt).toMatch(/paragraphs tagged `\[CODE\]`/);
   });
 });
