@@ -54,6 +54,7 @@ import { CitationModal } from './CitationModal';
 import { CitationPopover } from './CitationPopover';
 import { LessonCanvas } from './LessonCanvas';
 import { MermaidDiagram } from './MermaidDiagram';
+import { DiagramBlock } from './diagrams/DiagramBlock';
 
 /**
  * Sprint C Phase 2 — popover vs modal threshold. Citations covering 1-2 source
@@ -405,15 +406,22 @@ export function ChapterRenderer({ narrative, sourceParagraphs, isFirstLesson = f
       ),
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       code: ({ inline, className, children, ...rest }: any) => {
-        const isMermaid =
-          !inline &&
-          typeof className === 'string' &&
-          /\blanguage-mermaid\b/.test(className);
+        const classes = typeof className === 'string' ? className : '';
+        // Sprint F.1: ```diagram fenced JSON → DiagramBlock router. The
+        // router internally parses + validates and falls back to a
+        // brand-themed source-text block on Zod failure, so any malformed
+        // JSON renders gracefully without crashing the chapter.
+        const isDiagram = !inline && /\blanguage-diagram\b/.test(classes);
+        if (isDiagram) {
+          const source = (Array.isArray(children) ? children.join('') : String(children ?? '')).trim();
+          if (source.length === 0) return null;
+          return <DiagramBlock rawJSON={source} />;
+        }
+        // Sprint Bv2.5: ```mermaid → MermaidDiagram (escape-hatch path
+        // for diagrams the structured primitives don't cover). Stays
+        // unchanged from prior behavior.
+        const isMermaid = !inline && /\blanguage-mermaid\b/.test(classes);
         if (isMermaid) {
-          // Mermaid source is the raw text content of the code block.
-          // react-markdown gives us children as an array of strings (or a
-          // single string); join + trim for safety against fence-trailing
-          // whitespace.
           const source = (Array.isArray(children) ? children.join('') : String(children ?? '')).trim();
           if (source.length === 0) return null;
           return <MermaidDiagram source={source} />;

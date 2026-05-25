@@ -1,0 +1,102 @@
+// src/components/diagrams/DiagramBlock.tsx — Sprint F.1 router.
+//
+// What this component does:
+//   1. Takes the raw JSON body of a ```diagram fenced block.
+//   2. Parses + validates via parseDiagramBlock (returns Result-shaped output).
+//   3. Routes valid payloads to the appropriate primitive component.
+//   4. Falls back to a brand-themed source-text block on parse failure.
+//
+// Server-component safe (no DOM access, no hooks). All decisions happen
+// synchronously in the render function.
+//
+// Fallback shape:
+// ---------------
+// Mirrors MermaidDiagram.tsx:144-155: a <figure> wrapping a
+// `<pre>` containing the original source + a warn-styled footer
+// describing the parse error. This degrades gracefully — the reader sees
+// the LLM's intended content as text rather than a hole in the page, and
+// the warn footer surfaces the failure so operators can investigate.
+// Matches `kb:architecture/discipline/stability-patterns §Fail Fast` +
+// `kb:architecture/discipline/error-handling-discipline §"Pattern 7"`.
+
+import React from 'react';
+import { parseDiagramBlock } from '@/lib/diagrams/parse';
+import { ComparisonTable } from './ComparisonTable';
+import { DefinitionList } from './DefinitionList';
+
+export function DiagramBlock({ rawJSON }: { rawJSON: string }) {
+  const result = parseDiagramBlock(rawJSON);
+
+  if (!result.ok) {
+    return <DiagramFallback rawJSON={rawJSON} errorMessage={result.error.message} />;
+  }
+
+  const { payload } = result;
+  switch (payload.kind) {
+    case 'ComparisonTable':
+      return <ComparisonTable payload={payload} />;
+    case 'DefinitionList':
+      return <DefinitionList payload={payload} />;
+    // Sprint F.2 primitives: render-pending. We mark them visually so the
+    // empirical signal from production tells us which shapes the LLM is
+    // emitting before we invest in their SVG layout code.
+    case 'DiagramFlow':
+    case 'StateTransitionDiagram':
+    case 'SequenceDiagram':
+    case 'DecisionTree':
+      return <DiagramPending kind={payload.kind} rawJSON={rawJSON} />;
+    default: {
+      // Exhaustiveness — TypeScript narrows `payload` to `never` here. If
+      // a new primitive is added to the schema without a case above,
+      // this branch fires the typecheck error at compile-time.
+      const _exhaustive: never = payload;
+      return <DiagramFallback rawJSON={rawJSON} errorMessage="unknown diagram kind" />;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Fallback views — parse error + Sprint-F.2-pending
+// ---------------------------------------------------------------------------
+
+function DiagramFallback({
+  rawJSON,
+  errorMessage,
+}: {
+  rawJSON: string;
+  errorMessage: string;
+}) {
+  return (
+    <figure
+      className="my-stanza border-l-4 border-warn bg-paper-deep px-4 py-3"
+      role="img"
+      aria-label={`Diagram source (could not parse: ${errorMessage})`}
+    >
+      <pre className="overflow-x-auto font-mono text-caption text-ink">{rawJSON}</pre>
+      <figcaption className="mt-2 font-display text-caption text-warn">
+        Diagram source — could not parse: {errorMessage}
+      </figcaption>
+    </figure>
+  );
+}
+
+function DiagramPending({
+  kind,
+  rawJSON,
+}: {
+  kind: 'DiagramFlow' | 'StateTransitionDiagram' | 'SequenceDiagram' | 'DecisionTree';
+  rawJSON: string;
+}) {
+  return (
+    <figure
+      className="my-stanza border border-dashed border-paper-edge bg-paper-deep px-4 py-3"
+      role="img"
+      aria-label={`Diagram of kind ${kind} (renderer pending — see source)`}
+    >
+      <pre className="overflow-x-auto font-mono text-caption text-ink-muted">{rawJSON}</pre>
+      <figcaption className="mt-2 font-display text-caption text-ink-muted">
+        {kind} renderer ships in Sprint F.2 — JSON shown for now
+      </figcaption>
+    </figure>
+  );
+}
