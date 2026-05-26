@@ -40,7 +40,11 @@
  * (success / warn / info / ink-faint).
  */
 
-import { CheckCircle2, Circle, Lock, Loader2, ChevronRight } from 'lucide-react';
+// SI-vitest-react-import-001: explicit React import for vitest's classic
+// JSX transform (Next.js production build handles auto-injection; vitest
+// does not).
+import React from 'react';
+import { CheckCircle2, Circle, Lock, Loader2, ChevronRight, AlertCircle } from 'lucide-react';
 
 // ───────────────────────────────────────────────────────────────────────────
 // Public types
@@ -131,7 +135,20 @@ function groupByPart(chapters: TutorialOutlineChapter[]): PartGroup[] {
 // Display-state normalisation
 // ───────────────────────────────────────────────────────────────────────────
 
-type DisplayState = 'locked' | 'pending' | 'streaming' | 'complete';
+// BUG-1 fix (5-persona walkthrough): the outline must visually distinguish a
+// pending (queued, no LLM activity yet) chapter from a streaming (tokens
+// arriving over SSE) chapter from a partial (narrative complete, quiz
+// failed) chapter from a failed (LLM call errored) chapter. Pre-fix, every
+// non-complete row carried the streaming Loader2 spinner because the
+// upstream StreamingClient was projecting every non-complete chapter to
+// status='streaming'. Now we honor whatever the upstream sends.
+type DisplayState =
+  | 'locked'
+  | 'pending'
+  | 'streaming'
+  | 'partial'
+  | 'failed'
+  | 'complete';
 
 function displayStateFor(
   chapter: TutorialOutlineChapter,
@@ -140,6 +157,8 @@ function displayStateFor(
   if (chapter.ordinal > maxUnlocked) return 'locked';
   if (chapter.status === 'complete') return 'complete';
   if (chapter.status === 'streaming') return 'streaming';
+  if (chapter.status === 'partial') return 'partial';
+  if (chapter.status === 'failed') return 'failed';
   return 'pending';
 }
 
@@ -147,13 +166,21 @@ const STATE_PILL_CLASSES: Record<DisplayState, string> = {
   locked: 'border-paper-edge bg-paper-deep/40 text-ink-faint',
   pending: 'border-paper-edge bg-paper text-ink-muted',
   streaming: 'border-info/40 bg-info-fade text-info',
+  partial: 'border-warn/40 bg-warn-fade text-warn',
+  failed: 'border-destructive/40 bg-destructive/10 text-destructive',
   complete: 'border-success/40 bg-success-fade text-success',
 };
 
 const STATE_LABEL: Record<DisplayState, string> = {
   locked: 'Locked',
-  pending: 'Pending',
+  // BUG-1 fix: "Not yet generated" is more honest than the bare "Pending"
+  // (which the personas read as "something is happening, please wait").
+  // The pill still wears the calm paper-edge styling — no animation, no
+  // hue — so it visually recedes vs the streaming row.
+  pending: 'Not yet generated',
   streaming: 'Streaming',
+  partial: 'Quiz unavailable',
+  failed: 'Generation failed',
   complete: 'Complete',
 };
 
@@ -236,9 +263,17 @@ export function TutorialOutline({
                           className="mt-0.5 h-3.5 w-3.5 shrink-0 text-success"
                         />
                       ) : state === 'streaming' ? (
+                        // BUG-1 fix: the spinning Loader2 is ONLY shown for
+                        // genuine streaming. A queued chapter gets the
+                        // motion-free Circle below — no fake activity.
                         <Loader2
                           aria-hidden="true"
                           className="mt-0.5 h-3.5 w-3.5 shrink-0 animate-spin text-info"
+                        />
+                      ) : state === 'partial' || state === 'failed' ? (
+                        <AlertCircle
+                          aria-hidden="true"
+                          className={`mt-0.5 h-3.5 w-3.5 shrink-0 ${state === 'failed' ? 'text-destructive' : 'text-warn'}`}
                         />
                       ) : (
                         <Circle
