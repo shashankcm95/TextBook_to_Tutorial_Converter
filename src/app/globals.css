@@ -241,6 +241,13 @@
   .mb-lead     { margin-bottom: 1rem; }
   .mb-stanza   { margin-bottom: 1.75rem; }
   .mb-section  { margin-bottom: 3rem; }
+  /* `my-stanza` shorthand — used by MermaidDiagram + ChapterRenderer +
+   * Sprint F.1/F.2 diagram primitives. Pre-existing references silently
+   * produced no margin because Tailwind doesn't auto-generate `my-X`
+   * unless `X` is in the spacing config (which is locked). Defined here
+   * so all `<figure className="my-stanza">` callers get the intended
+   * vertical rhythm. Sprint F.2 Wave 2 fix-up. */
+  .my-stanza   { margin-top: 1.75rem; margin-bottom: 1.75rem; }
   .py-page     { padding-top: 5rem; padding-bottom: 5rem; }
   .px-gutter   { padding-left: 1.5rem; padding-right: 1.5rem; }
 

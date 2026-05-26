@@ -46,6 +46,7 @@ import {
   type RatingResult,
 } from './persona';
 import { renderReport } from './report';
+import { computeDiagramDensity, type DiagramDensity } from './diagram-density';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public shape
@@ -127,6 +128,11 @@ export async function runEvalHarness(cfg: RunnerConfig): Promise<RunnerResult> {
   const allRatings: RatingResult[] = [];
   const narrativesByVariant = new Map<string, ChapterNarrative[]>();
   const fidelityByVariant: Record<string, Record<number, number>> = {};
+  // Sprint F.2 §"diagram_block_density_per_chapter metric": compute per-kind
+  // emission counts for each chapter narrative at load-time and thread into
+  // the ReportInput. Strictly additive — when no `\`\`\`diagram` blocks appear
+  // the per-variant map stays empty and the report omits the section.
+  const diagramDensityByVariant: Record<string, Record<number, DiagramDensity>> = {};
 
   for (const variant of variants) {
     log(`[eval] variant=${variant.name}: applying`);
@@ -148,6 +154,14 @@ export async function runEvalHarness(cfg: RunnerConfig): Promise<RunnerResult> {
       if (Object.keys(fidMap).length > 0) {
         fidelityByVariant[variant.name] = fidMap;
       }
+
+      // Compute per-chapter diagram density. Empty map allowed — `renderReport`
+      // omits the section when all variants have zero rows.
+      const densityMap: Record<number, DiagramDensity> = {};
+      for (const n of narratives) {
+        densityMap[n.chapterOrdinal] = computeDiagramDensity(n.narrativeMarkdown);
+      }
+      diagramDensityByVariant[variant.name] = densityMap;
     } finally {
       revertVariant(applied);
       log(`[eval] variant=${variant.name}: reverted`);
@@ -207,6 +221,8 @@ export async function runEvalHarness(cfg: RunnerConfig): Promise<RunnerResult> {
     ratings: allRatings,
     fidelityByVariant:
       Object.keys(fidelityByVariant).length > 0 ? fidelityByVariant : undefined,
+    diagramDensityByVariant:
+      Object.keys(diagramDensityByVariant).length > 0 ? diagramDensityByVariant : undefined,
     recommendedNextMove: cfg.recommendedNextMove,
   });
 

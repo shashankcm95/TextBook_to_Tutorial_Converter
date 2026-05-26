@@ -225,6 +225,78 @@ describe('renderReport — D6 Scorer vs humans', () => {
   });
 });
 
+describe('renderReport — Sprint F.2 diagram emission density', () => {
+  it('renders the section with a per-variant per-chapter row when supplied', () => {
+    const md = renderReport({
+      runId: 'r',
+      variantNames: ['v3', 'v4'],
+      personaSlugs: ['professor'],
+      chapterRange: [0, 0],
+      ratings: [mkRating({ variantName: 'v3' }), mkRating({ variantName: 'v4' })],
+      diagramDensityByVariant: {
+        v3: {
+          0: {
+            byKind: {
+              ComparisonTable: 1,
+              DefinitionList: 0,
+              DiagramFlow: 0,
+              StateTransitionDiagram: 0,
+              SequenceDiagram: 0,
+              DecisionTree: 0,
+            },
+            totalValid: 1,
+            parseFailures: 0,
+            mermaidBlocks: 0,
+          },
+        },
+        v4: {
+          0: {
+            byKind: {
+              ComparisonTable: 0,
+              DefinitionList: 2,
+              DiagramFlow: 1,
+              StateTransitionDiagram: 0,
+              SequenceDiagram: 0,
+              DecisionTree: 0,
+            },
+            totalValid: 3,
+            parseFailures: 1,
+            mermaidBlocks: 2,
+          },
+        },
+      },
+    });
+    expect(md).toContain('## Diagram emission density');
+    // v3 row: 1 ComparisonTable, 0 elsewhere, 0 mermaid, 0 failures
+    expect(md).toMatch(/\| v3 \| 0 \| 1 \| 0 \| 0 \| 0 \| 0 \| 0 \| 0 \| 0 \|/);
+    // v4 row: 0/2/1/0/0/0, 2 mermaid, 1 failure
+    expect(md).toMatch(/\| v4 \| 0 \| 0 \| 2 \| 1 \| 0 \| 0 \| 0 \| 2 \| 1 \|/);
+  });
+
+  it('omits the section when diagramDensityByVariant is absent', () => {
+    const md = renderReport({
+      runId: 'r',
+      variantNames: ['v3'],
+      personaSlugs: ['professor'],
+      chapterRange: [0, 0],
+      ratings: [mkRating()],
+    });
+    expect(md).not.toContain('## Diagram emission density');
+  });
+
+  it('omits the section when diagramDensityByVariant is supplied but empty', () => {
+    const md = renderReport({
+      runId: 'r',
+      variantNames: ['v3'],
+      personaSlugs: ['professor'],
+      chapterRange: [0, 0],
+      ratings: [mkRating()],
+      diagramDensityByVariant: {},
+    });
+    expect(md).not.toContain('## Diagram emission density');
+  });
+});
+
 describe('renderReport — recommended next move', () => {
   it('renders the optional section when supplied', () => {
     const md = renderReport({

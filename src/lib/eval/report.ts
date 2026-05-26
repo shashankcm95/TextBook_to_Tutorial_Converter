@@ -21,6 +21,7 @@
 
 import type { RatingResult } from './persona';
 import { PHASE_1_DIMENSIONS, type RubricDimension } from './rubric';
+import type { DiagramDensity } from './diagram-density';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public shapes
@@ -47,6 +48,16 @@ export interface ReportInput {
    * non-goal per HARNESS-DESIGN.md Phase 1 §non-goals).
    */
   recommendedNextMove?: string;
+  /**
+   * Optional: variant -> chapterOrdinal -> DiagramDensity. Drives the
+   * Sprint F.2 "Diagram emission density" section. Per RFC §"diagram
+   * _block_density_per_chapter metric": rendered as a per-kind table so
+   * readers can see which primitives the prompt is exercising vs the
+   * Mermaid escape-hatch. Variants without densities are silently
+   * skipped from that section; the section itself is omitted entirely
+   * when the field is absent or empty (strictly additive).
+   */
+  diagramDensityByVariant?: Record<string, Record<number, DiagramDensity>>;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -62,6 +73,10 @@ export function renderReport(input: ReportInput): string {
   sections.push(renderDivergentFindings(input));
   if (input.fidelityByVariant) {
     sections.push(renderScorerVsHumans(input));
+  }
+  const diagramSection = renderDiagramDensity(input);
+  if (diagramSection !== null) {
+    sections.push(diagramSection);
   }
   if (input.recommendedNextMove) {
     sections.push(renderRecommendedNextMove(input));
@@ -270,6 +285,54 @@ function renderScorerVsHumans(input: ReportInput): string {
   }
   if (!any) {
     lines.push('_No chapters trip the D6 signal in this run._');
+  }
+  return lines.join('\n');
+}
+
+/**
+ * Sprint F.2 §"diagram_block_density_per_chapter metric": render a per-kind
+ * emission table. Strictly additive — returns null (and thus omits the
+ * section entirely) when `diagramDensityByVariant` is absent or contains
+ * no rows. Existing report-rendering tests stay green.
+ */
+function renderDiagramDensity(input: ReportInput): string | null {
+  const byVariant = input.diagramDensityByVariant;
+  if (!byVariant) return null;
+
+  // Flatten into a row list so we can decide "empty?" honestly — a present
+  // but empty map still produces no section.
+  const rows: { variant: string; ordinal: number; density: DiagramDensity }[] = [];
+  for (const variant of input.variantNames) {
+    const perChapter = byVariant[variant];
+    if (!perChapter) continue;
+    const ordinals = Object.keys(perChapter)
+      .map((k) => Number(k))
+      .filter((n) => Number.isFinite(n))
+      .sort((a, b) => a - b);
+    for (const ord of ordinals) {
+      const density = perChapter[ord];
+      // Defensive: ordinal came from Object.keys(perChapter), so the lookup
+      // is by construction defined. The fallthrough satisfies strict
+      // noUncheckedIndexedAccess without adding runtime cost in the happy
+      // path.
+      if (!density) continue;
+      rows.push({ variant, ordinal: ord, density });
+    }
+  }
+  if (rows.length === 0) return null;
+
+  const lines: string[] = [
+    '## Diagram emission density',
+    '',
+    'Count of structured-diagram emissions per chapter, partitioned by `payload.kind`. Mermaid blocks tracked as a sibling column (escape-hatch signal, NOT collapsed into the per-kind sum). Parse failures tracked separately so they don\'t inflate or deflate emission rates.',
+    '',
+    '| Variant | Chapter | ComparisonTable | DefinitionList | DiagramFlow | StateTransition | Sequence | DecisionTree | Mermaid | Parse failures |',
+    '|---------|---------|-----------------|----------------|-------------|-----------------|----------|--------------|---------|----------------|',
+  ];
+  for (const { variant, ordinal, density } of rows) {
+    lines.push(
+      `| ${variant} | ${ordinal} | ${density.byKind.ComparisonTable} | ${density.byKind.DefinitionList} | ${density.byKind.DiagramFlow} | ${density.byKind.StateTransitionDiagram} | ${density.byKind.SequenceDiagram} | ${density.byKind.DecisionTree} | ${density.mermaidBlocks} | ${density.parseFailures} |`,
+    );
   }
   return lines.join('\n');
 }
