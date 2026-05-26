@@ -181,6 +181,23 @@ describe('weaveDiagrams — Strategy 3 (30% fallback)', () => {
     const charBeforeFence = fenceIdx >= 2 ? woven.slice(fenceIdx - 2, fenceIdx) : '';
     expect(['\n\n', '']).toContain(charBeforeFence);
   });
+
+  // Sprint H Wave 3 fix (Rev C HIGH-1): degenerate narrative with NO
+  // paragraph boundary past the 30% mark used to splice mid-word at the
+  // threshold offset. Now appends at end-of-string so the prose stays
+  // intact even when the fallback strategy fires on a pathological input.
+  it('appends at end-of-string when no paragraph boundary exists past the 30% mark', () => {
+    // Single dense paragraph — no \n\n anywhere.
+    const narrative = 'Just a single short paragraph with no breaks.';
+    const woven = weaveDiagrams(narrative, [{ payload: diagramFlow }]);
+    // Prose text must survive intact — verify the original sentence is
+    // present verbatim, not split mid-word.
+    expect(woven).toContain(narrative);
+    // Fence must follow the prose, not interrupt it.
+    const fenceIdx = woven.indexOf('```diagram');
+    const proseEndIdx = woven.indexOf(narrative) + narrative.length;
+    expect(fenceIdx).toBeGreaterThan(proseEndIdx);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -208,6 +225,30 @@ describe('weaveDiagrams — idempotency', () => {
     const once = weaveDiagrams(narrative, [d]);
     const twice = weaveDiagrams(once, [d]);
     expect(twice).toBe(once);
+  });
+
+  // Sprint H Wave 3 fix (Rev C HIGH-2): idempotency under citation-anchor
+  // strategy was untested. The dedup logic is canonical-JSON keyed and shared
+  // across strategies, but the explicit test asserts the load-bearing
+  // invariant for the path most likely to fire on real DDIA narratives
+  // (citations are dense; headings are sparse).
+  it('weave(weave(n, [d]), [d]) === weave(n, [d]) for a citation anchor', () => {
+    const narrative = [
+      'Opening paragraph.',
+      '',
+      'Body with [ref:page42:paragraph3] in it.',
+      '',
+      'Closing paragraph.',
+    ].join('\n');
+    const d: ExtractedDiagram = {
+      payload: comparisonTable,
+      anchorCitation: '[ref:page42:paragraph3]',
+    };
+    const once = weaveDiagrams(narrative, [d]);
+    const twice = weaveDiagrams(once, [d]);
+    expect(twice).toBe(once);
+    // Sanity: the fence is actually present once after the first weave.
+    expect((once.match(/```diagram\b/g) ?? []).length).toBe(1);
   });
 
   it('counts exactly one fence after a double-weave', () => {

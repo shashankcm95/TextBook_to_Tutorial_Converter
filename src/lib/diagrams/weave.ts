@@ -219,9 +219,14 @@ function findFallbackAnchor(narrative: string): number {
   // Look for the first "\n\n" (paragraph boundary) at or past the threshold.
   const idx = narrative.indexOf('\n\n', threshold);
   if (idx === -1) {
-    // No paragraph boundary — clamp to end of string. Splice with the
-    // built-in \n\n buffers handles the trailing-newline case.
-    return Math.min(threshold, narrative.length);
+    // Sprint H Wave 3 fix (Rev C HIGH-1): no paragraph boundary past the
+    // 30% mark — APPEND at end-of-string rather than splitting mid-word
+    // at the threshold. The original code returned `min(threshold,
+    // narrative.length)` whose comment claimed "clamp to end of string"
+    // but actually clamped to the 30% threshold, splitting words in
+    // pathologically-short narratives (no `\n\n` past 30%). End-of-string
+    // is the only insertion point guaranteed not to corrupt prose.
+    return narrative.length;
   }
   // Land just past the "\n\n" so we're between paragraphs, not after the
   // first \n of a still-active paragraph block.

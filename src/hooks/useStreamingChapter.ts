@@ -218,6 +218,13 @@ export function useStreamingChapter(
     setStatus('done');
     setError(null);
     setReconnectCount(0);
+    // Sprint H Wave 3 fix (Rev E HIGH-1): clear the extracting indicator on
+    // cancel. Without this, a user who hits "Stop" mid-extraction (after
+    // narrative-stream-complete fired but before diagrams-extracted arrives)
+    // gets a permanently-stuck "Generating diagrams…" spinner until they
+    // navigate to a different chapter. Count fields are preserved (caller may
+    // want to read the last successful run; mirror the `done` event branch).
+    setIsExtracting(false);
   }, [teardown]);
 
   useEffect(() => {
@@ -379,9 +386,17 @@ export function useStreamingChapter(
           }
           // All other events — just deliver to the caller. Status flips to
           // 'streaming' on first successful frame.
-          if (status !== 'streaming') {
-            setStatus('streaming');
-          }
+          //
+          // Sprint H Wave 3 fix (Rev E HIGH-2): use the functional updater
+          // form so we read the CURRENT status, not the stale captured-at-
+          // effect-open value. The outer effect intentionally omits `status`
+          // from its dependency array to avoid re-opening the stream on every
+          // status transition; that means the `status` symbol read here is
+          // the value from the render that created the effect, which is
+          // typically 'idle' or 'connecting' and never re-reads. Functional
+          // updater is the standard React idiom for read-and-set in a
+          // closure that cannot list the state in its dep array.
+          setStatus((prev) => (prev !== 'streaming' ? 'streaming' : prev));
           // Reset reconnect counter on any successful frame — we made
           // progress, so subsequent failures get a fresh budget.
           attempt = 0;

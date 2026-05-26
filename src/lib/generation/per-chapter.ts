@@ -352,11 +352,17 @@ export async function generateChapter(
   } catch (err) {
     // Narrative succeeded but quiz failed. Persist narrative-only as 'partial'
     // so the user can still read; mark quiz failure in error_message.
+    //
+    // Sprint H Wave 3 fix (Rev D HIGH-1): pass the WOVEN narrative so any
+    // diagrams the extractor already produced survive the partial-state path.
+    // Also pass the extract cost row so the spend is accounted for even when
+    // quiz failed (extract billed regardless).
     await persistNarrativeOnly(
       chapter.id,
       tutorialId,
-      narrativeResult,
+      { ...narrativeResult, narrative: wovenNarrative },
       sourceParagraphs,
+      extractParseCostRow,
     );
     throw err;
   }
@@ -404,7 +410,10 @@ export async function generateChapter(
         })
         .run();
     }
-    // parses_cost rows — one per LLM call
+    // parses_cost rows — one per LLM call.
+    // Sprint H Wave 3 (Rev D HIGH-2): `stage` discriminator added via
+    // migration 0006. Quiz + extract both use gpt-4o-mini; before the
+    // column rows were indistinguishable at query time.
     tx.insert(parsesCost)
       .values({
         id: crypto.randomUUID(),
@@ -415,6 +424,7 @@ export async function generateChapter(
         completionTokens: narrativeResult.completionTokens,
         costUsd: narrativeResult.costUsd,
         validationDropCount: 0,
+        stage: 'narrative',
       })
       .run();
     tx.insert(parsesCost)
@@ -427,16 +437,12 @@ export async function generateChapter(
         completionTokens: quizResult.completionTokens,
         costUsd: quizResult.costUsd,
         validationDropCount: quizResult.validationDropCount,
+        stage: 'quiz',
       })
       .run();
     // Sprint H Wave 1 (Builder D): third parses_cost row for the
     // diagram-extraction call. Only inserted when extract succeeded
     // (fail-open path skips it — there's nothing to account for).
-    // parses_cost schema has no `purpose`/`stage` column; the row is
-    // distinguishable from the narrative+quiz rows by the model name
-    // (gpt-4o-mini, like quiz) AND its zero validation_drop_count + the
-    // ordinal of insertion. A future migration could add a `stage` enum
-    // if telemetry needs it (RFC §future-work).
     if (extractParseCostRow) {
       tx.insert(parsesCost)
         .values({
@@ -448,6 +454,7 @@ export async function generateChapter(
           completionTokens: extractParseCostRow.completionTokens,
           costUsd: extractParseCostRow.costUsd,
           validationDropCount: 0,
+          stage: 'extract-diagrams',
         })
         .run();
     }
@@ -631,10 +638,20 @@ async function persistNarrativeOnly(
     costUsd: number;
   },
   sourceParagraphs: SourceParagraph[],
+  extractParseCostRow: {
+    model: string;
+    promptTokens: number;
+    completionTokens: number;
+    costUsd: number;
+  } | null = null,
 ): Promise<void> {
   db.transaction((tx) => {
     tx.update(chapters)
       .set({
+        // Sprint H Wave 3 fix (Rev D HIGH-1): caller passes wovenNarrative
+        // (with ```diagram fences) when extraction succeeded so partial-state
+        // chapters preserve the structured content. When extraction failed or
+        // returned 0 diagrams, this equals narrativeResult.narrative.
         narrative: narrativeResult.narrative,
         status: 'partial',
         sourceParagraphsJson: JSON.stringify(sourceParagraphs),
@@ -651,7 +668,26 @@ async function persistNarrativeOnly(
         completionTokens: narrativeResult.completionTokens,
         costUsd: narrativeResult.costUsd,
         validationDropCount: 0,
+        stage: 'narrative',
       })
       .run();
+    // Sprint H Wave 3 (Rev D HIGH-1): record extract cost on the partial-
+    // state path too. Extract already billed before quiz failed; dropping
+    // the row would underreport spend.
+    if (extractParseCostRow) {
+      tx.insert(parsesCost)
+        .values({
+          id: crypto.randomUUID(),
+          tutorialId,
+          chapterId,
+          model: extractParseCostRow.model,
+          promptTokens: extractParseCostRow.promptTokens,
+          completionTokens: extractParseCostRow.completionTokens,
+          costUsd: extractParseCostRow.costUsd,
+          validationDropCount: 0,
+          stage: 'extract-diagrams',
+        })
+        .run();
+    }
   });
 }

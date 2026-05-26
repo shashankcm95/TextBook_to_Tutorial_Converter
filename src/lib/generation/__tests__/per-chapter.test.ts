@@ -674,6 +674,60 @@ describe('per-chapter — Sprint H Wave 1 (extract + weave integration)', () => 
     expect(parsesCostRows).toHaveLength(2);
   });
 
+  // Sprint H Wave 3 fix (Rev D HIGH-1) — gate-blocking regression:
+  // before this fix, persistNarrativeOnly (called on the quiz-failure path)
+  // wrote `narrativeResult.narrative` (raw prose) instead of the wovenNarrative
+  // that the extractor + weave had already produced. The user would refresh
+  // the chapter, see status='partial', and the diagrams would be silently
+  // gone — even though the extract LLM call had succeeded and billed.
+  it('quiz-failure path: extract succeeded → woven narrative still persisted + extract cost recorded', async () => {
+    const fakeDiagrams = [
+      { kind: 'ComparisonTable', title: 'A vs B', columns: ['A', 'B'], rows: [] } as unknown,
+    ];
+    extractDiagramsMock.mockResolvedValue({
+      diagrams: fakeDiagrams,
+      droppedCount: 0,
+      promptTokens: 200,
+      completionTokens: 100,
+      costUsd: 0.0006,
+      model: 'gpt-4o-mini',
+    });
+    const wovenSentinel =
+      'Some narrative output.\n\n```diagram\n{"kind":"ComparisonTable"}\n```\n';
+    weaveDiagramsMock.mockReturnValue(wovenSentinel);
+
+    // Quiz call throws — narrative succeeded but the quiz LLM 500s/refuses.
+    generateQuizFromNarrativeMock.mockRejectedValue(
+      new Error('quiz-from-narrative: model timeout'),
+    );
+
+    const onDiagramsExtracted = vi.fn();
+    await expect(
+      generateChapter({
+        tutorialId: 'tutorial-1',
+        chapterIdx: 0,
+        onDiagramsExtracted,
+      }),
+    ).rejects.toThrow(/quiz-from-narrative/);
+
+    // The partial-state update wrote the WOVEN narrative — not the raw.
+    expect(chapterUpdates).toHaveLength(1);
+    expect(chapterUpdates[0]?.status).toBe('partial');
+    expect(chapterUpdates[0]?.narrative).toBe(wovenSentinel);
+
+    // parses_cost rows: narrative + extract (2 total — no quiz row since it
+    // never completed). Both must be present so we don't underreport spend.
+    const parsesCostRows = txInserts.filter((e) => e.table === 'parses_cost');
+    expect(parsesCostRows).toHaveLength(2);
+    // The extract row is identifiable by its cost-usd fingerprint.
+    const extractRow = parsesCostRows.find((e) => e.row.costUsd === 0.0006);
+    expect(extractRow).toBeTruthy();
+    expect(extractRow?.row.stage).toBe('extract-diagrams');
+    // Narrative row also has the stage set.
+    const narrativeRow = parsesCostRows.find((e) => e.row.model === 'gpt-4o');
+    expect(narrativeRow?.row.stage).toBe('narrative');
+  });
+
   it('no onDiagramsExtracted callback provided → no throw, extract+weave still wired', async () => {
     // Defensive: optional callback must be safe to omit (SSE-less callers
     // like the prefetch path do not pass it).
