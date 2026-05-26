@@ -43,7 +43,12 @@
  * triggers re-render. Mutating in place would silently miss the update.
  */
 
-import { useState, useCallback, useMemo, useEffect } from 'react';
+// SI-vitest-react-import-001: explicit React import required for vitest's
+// classic JSX transform (Next.js + SWC handle this automatically in prod;
+// vitest uses esbuild's transform which doesn't auto-inject). Without this
+// import, the StreamingClient.pending-state.test.tsx suite throws
+// "React is not defined" at first render.
+import React, { useState, useCallback, useMemo, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import type { Chapter } from '@/db/schema';
 import type { SourceParagraph, QuizQuestion, LLMFlashcard } from '@/lib/types';
@@ -117,8 +122,23 @@ interface ChapterStreamState {
    *  while the LLM emits structured output; parsed into parsedNarrative on
    *  chapter-complete. See FINDING-RENDER-1 fix. */
   narrative: string;
-  /** Status: 'streaming' until chapter-complete, then 'complete'. */
-  status: 'streaming' | 'complete' | 'failed';
+  /**
+   * Display status — strict subset of the DB enum, projected for the client.
+   *
+   *   - 'pending'   — queued, no LLM activity yet. The honest "Not yet
+   *                   generated" state. (BUG-1 fix: previously coerced to
+   *                   'streaming', producing the lying "Generating chapter…
+   *                   0 chars received" indicator on every queued row.)
+   *   - 'streaming' — SSE is currently delivering tokens for this chapter.
+   *                   This is when "Generating chapter… N chars received"
+   *                   is actually true.
+   *   - 'partial'   — narrative succeeded but quiz/flashcards failed. The
+   *                   narrative is readable; the gate surfaces the degraded
+   *                   state explicitly.
+   *   - 'complete'  — final state.
+   *   - 'failed'    — LLM call errored end-to-end.
+   */
+  status: 'pending' | 'streaming' | 'partial' | 'complete' | 'failed';
   /** SourceParagraph index for citation resolution. */
   sourceParagraphs: SourceParagraph[];
   /** Markdown narrative parsed out of the structured-output JSON. Only set
@@ -292,12 +312,24 @@ function chapterRowToStreamState(
     hydratedFlashcards && hydratedFlashcards.length > 0
       ? hydratedFlashcards
       : parsedFromJson?.flashcards;
+  // BUG-1 fix (5-persona walkthrough — universally flagged): map the DB
+  // status faithfully instead of collapsing 'pending' / 'generating' into a
+  // single client 'streaming' bucket. Coercing 'pending' to 'streaming'
+  // produced the dishonest "Generating chapter… 0 chars received" indicator
+  // on chapters that had NO live LLM activity. Each DB state now projects
+  // to its own client display state so the UI can speak the truth.
+  let projectedStatus: ChapterStreamState['status'];
+  if (c.status === 'complete') projectedStatus = 'complete';
+  else if (c.status === 'partial') projectedStatus = 'partial';
+  else if (c.status === 'failed') projectedStatus = 'failed';
+  else if (c.status === 'generating') projectedStatus = 'streaming';
+  else projectedStatus = 'pending'; // 'pending' in the DB → 'pending' here
   return {
     id: c.id,
     ordinal: c.ordinal,
     title: c.title,
     narrative: raw,
-    status: isReadable ? 'complete' : c.status === 'failed' ? 'failed' : 'streaming',
+    status: projectedStatus,
     sourceParagraphs: sp,
     parsedNarrative,
     parsedQuestions: questions,
@@ -575,7 +607,21 @@ export function StreamingClient(props: StreamingClientProps) {
           sourcePageStart: 0,
           sourcePageEnd: 0,
           sourceParagraphsJson: '[]',
-          status: c.status === 'complete' ? 'complete' : 'generating',
+          // BUG-1 fix: map the client display state back to the DB enum
+          // faithfully so CompletionTracker (and any future consumer) sees
+          // the same honest picture the chapter body shows. Previously every
+          // non-complete chapter was reported as 'generating' here — same
+          // class of dishonesty as the "0 chars received" bug below.
+          status:
+            c.status === 'complete'
+              ? 'complete'
+              : c.status === 'partial'
+                ? 'partial'
+                : c.status === 'failed'
+                  ? 'failed'
+                  : c.status === 'streaming'
+                    ? 'generating'
+                    : 'pending',
           isRead: c.status === 'complete',
           // riley HIGH-2 fields: read from local interaction tracker (out of
           // scope for this iteration to wire fully — for streaming-time we
@@ -734,7 +780,17 @@ export function StreamingClient(props: StreamingClientProps) {
                   >
                     {c.ordinal + 1}. {c.title}
                   </h2>
-                  {c.status === 'streaming' ? (
+                  {c.status === 'pending' ? (
+                    // BUG-1 fix: queued chapters get a calm "not yet
+                    // generated" placeholder instead of the lying "Generating
+                    // chapter… 0 chars received" indicator. Activity copy is
+                    // reserved for genuine streaming (the branch below).
+                    <PendingChapterPlaceholder
+                      ordinal={c.ordinal}
+                      title={c.title}
+                      isActive={c.ordinal === activeChapterIdx}
+                    />
+                  ) : c.status === 'streaming' ? (
                     <StreamingProgressIndicator receivedChars={c.narrative.length} />
                   ) : c.parsedNarrative !== undefined ? (
                     // Feature A — multipage chapters. ChapterLessons parses
@@ -760,6 +816,20 @@ export function StreamingClient(props: StreamingClientProps) {
                         const quizGateOk = !hasQuiz || quizAttempted;
                         return (
                           <>
+                            {c.status === 'partial' ? (
+                              // BUG-1 fix: 'partial' = narrative succeeded
+                              // but quiz/flashcards generation failed. Tell
+                              // the reader honestly so they're not waiting
+                              // for a quiz that will never appear.
+                              <p
+                                role="status"
+                                className="mt-stanza rounded-md border border-warn/30 bg-warn-fade px-3 py-2 text-caption text-warn"
+                              >
+                                Quiz unavailable — quiz generation failed for
+                                this chapter. The narrative is complete; you
+                                can still mark the chapter read below.
+                              </p>
+                            ) : null}
                             {c.parsedQuestions && c.parsedQuestions.length > 0 ? (
                               <QuizQuestions
                                 questions={c.parsedQuestions}
@@ -892,11 +962,84 @@ const STATUS_CLASSES: Record<ReturnType<typeof useStreamingChapter>['status'], s
 // Per-chapter inline surfaces (FINDING-RENDER-1 fix, Phase 5)
 // ───────────────────────────────────────────────────────────────────────────
 
-function StreamingProgressIndicator({ receivedChars }: { receivedChars: number }) {
+interface PendingChapterPlaceholderProps {
+  ordinal: number;
+  title: string;
+  /**
+   * True iff this chapter is the activeChapterIdx target — i.e., the
+   * SSE stream is about to begin emitting tokens for it any moment.
+   * Switches the calm "Not yet generated" copy to a quieter "Queued —
+   * starting shortly" so we don't claim queued-status during the
+   * pre-first-token window. Still does NOT lie about chars received.
+   */
+  isActive: boolean;
+}
+
+/**
+ * BUG-1 fix (5-persona walkthrough — Riley, Priya, Theo, Maya, Sam all
+ * independently flagged this as universally blocking trust).
+ *
+ * Pre-fix behavior: any chapter that wasn't yet `complete` rendered the
+ * StreamingProgressIndicator, which says "Generating chapter… 0 chars
+ * received" even when NO LLM activity was happening. The personas read
+ * that as a hung session.
+ *
+ * Post-fix: a queued chapter shows this honest placeholder. It tells the
+ * reader WHAT the state is ("not yet generated") and what will happen
+ * ("will be generated when you complete the prior chapter / start
+ * reading"). No fake progress, no spinning indicator, no character
+ * counter. The streaming indicator is now reserved for genuine
+ * streaming-status chapters where chars ARE arriving over SSE.
+ */
+// Exported for unit tests (BUG-1 fix coverage). Internal API; no production
+// callers outside this file.
+export function PendingChapterPlaceholder({
+  ordinal: _ordinal,
+  title: _title,
+  isActive,
+}: PendingChapterPlaceholderProps) {
+  // Two flavours of honest copy:
+  //  - active (lazy-hybrid-chunking has selected this chapter for the next
+  //    SSE stream): "Queued — starting shortly". Brief, calm, accurate.
+  //  - quiet (chapter is unlocked but the user hasn't progressed to it,
+  //    or generation hasn't been triggered): "Not yet generated".
+  const headline = isActive ? 'Queued — starting shortly' : 'Not yet generated';
+  const detail = isActive
+    ? 'The first tokens will arrive in a moment.'
+    : 'This chapter will be generated when you reach it.';
+  return (
+    <div
+      // aria-live: polite (not assertive). When the chapter flips from
+      // pending → streaming and the parent swaps this placeholder for
+      // the streaming indicator, screen readers announce the change
+      // without interrupting the user.
+      role="status"
+      aria-live="polite"
+      className="rounded-md border border-dashed border-paper-edge bg-paper-deep/40 px-4 py-6 text-center"
+    >
+      <p className="font-sans text-sm text-ink-muted">{headline}</p>
+      <p className="mt-1 font-sans text-caption text-ink-faint">{detail}</p>
+    </div>
+  );
+}
+
+// Exported for unit tests (BUG-1 fix coverage). Internal API; no production
+// callers outside this file.
+export function StreamingProgressIndicator({ receivedChars }: { receivedChars: number }) {
   // Show progress as a friendly chip while the LLM emits structured JSON.
   // We deliberately do NOT show the raw JSON — it's visually noisy and
   // unhelpful to the reader. Once chapter-complete fires, the parent
   // re-renders this section as markdown + questions + flashcards.
+  //
+  // BUG-1 fix: only show the char counter once tokens have actually started
+  // arriving. Before the first token, "0 chars received" reads as a lie
+  // (the same trust-destroying signal that prompted this whole fix). The
+  // pending-state branch upstream handles the pre-stream window; once we
+  // enter streaming, we may briefly hit receivedChars=0 between
+  // chapter-start and the first token. In that window we show only the
+  // "Generating chapter…" line — honest about the activity, silent about
+  // the count until there's a count to honestly report.
+  const hasTokens = receivedChars > 0;
   return (
     <div className="rounded-md border border-dashed border-border bg-muted/30 px-4 py-6 text-center">
       <p
@@ -905,9 +1048,11 @@ function StreamingProgressIndicator({ receivedChars }: { receivedChars: number }
       >
         Generating chapter…
       </p>
-      <p className="mt-1 text-xs text-muted-foreground/70">
-        {receivedChars.toLocaleString()} chars received
-      </p>
+      {hasTokens ? (
+        <p className="mt-1 text-xs text-muted-foreground/70">
+          {receivedChars.toLocaleString()} chars received
+        </p>
+      ) : null}
     </div>
   );
 }
