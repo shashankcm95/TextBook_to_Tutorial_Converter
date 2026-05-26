@@ -51,19 +51,12 @@ import {
   DIAGRAMS_EXTRACTED_EVENT,
   NARRATIVE_STREAM_COMPLETE_EVENT,
   type DiagramsExtractedEvent,
-  type OnDiagramsExtracted,
 } from '@/lib/generation/diagrams-extracted-event';
 
-// Sprint H Wave 1 (Builder E): the SSE route accepts an `onDiagramsExtracted`
-// callback that Builder D will thread through `generateChapter`. Until
-// Builder D's PR lands, `GenerateChapterArgs` does not yet declare the
-// field; we union the contract type here so the route compiles today and
-// Builder D's addition becomes a no-op change to this file. Once Builder D
-// merges, drop this alias and import `OnDiagramsExtracted` directly into
-// the args.
-type GenerateChapterArgsWithDiagrams = GenerateChapterArgs & {
-  onDiagramsExtracted?: OnDiagramsExtracted;
-};
+// Sprint H Wave 1 (Builder D): `GenerateChapterArgs` natively declares
+// `onDiagramsExtracted` after Builder D landed — the temporary
+// `GenerateChapterArgsWithDiagrams` intersection alias that lived here has
+// been removed. The route now uses GenerateChapterArgs directly.
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -182,14 +175,13 @@ export async function GET(
       });
 
       try {
-        // Sprint H Wave 1 (Builder E): pass through the optional
-        // `onDiagramsExtracted` callback via the union alias above so this
-        // compiles before Builder D adds the field to GenerateChapterArgs.
-        // The pre-D path simply never invokes the callback (extract isn't
-        // wired yet), so `diagrams-extracted` won't be emitted on pre-D
-        // runs — the streaming hook handles that silently (isExtracting
-        // stays true through chapter-complete; cosmetic-only).
-        const generateArgs: GenerateChapterArgsWithDiagrams = {
+        // Sprint H Wave 1 (Builder D landed): `onDiagramsExtracted` is now
+        // a first-class field on `GenerateChapterArgs`. The per-chapter
+        // pipeline invokes the callback after a successful extract; on the
+        // fail-open path (extract error / cost-cap rejection) the callback
+        // is NOT invoked — the streaming hook then leaves `isExtracting`
+        // true through `chapter-complete` (cosmetic; UX still correct).
+        const generateArgs: GenerateChapterArgs = {
           tutorialId,
           chapterIdx,
           abortSignal: abort.signal,
