@@ -367,10 +367,10 @@ describe('WIRE_SCHEMA strict-mode invariants', () => {
     });
   });
 
-  it('declares exactly 6 oneOf branches under diagrams.items', () => {
+  it('declares exactly 6 anyOf branches under diagrams.items (anyOf required by strict-mode; oneOf rejected)', () => {
     const items = WIRE_SCHEMA.properties.diagrams.items;
-    expect(items.oneOf).toHaveLength(6);
-    const discriminators = items.oneOf.map((b) => (b.properties.kind as { const: string }).const);
+    expect(items.anyOf).toHaveLength(6);
+    const discriminators = items.anyOf.map((b) => (b.properties.kind as { const: string }).const);
     expect(new Set(discriminators).size).toBe(6);
   });
 });

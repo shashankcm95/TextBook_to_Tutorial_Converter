@@ -131,7 +131,7 @@ export type WireDiagram =
 // WIRE_SCHEMA — JSON-Schema 2020 literal for OpenAI strict-mode response_format
 // ---------------------------------------------------------------------------
 //
-// Root shape: `{ diagrams: Array<WireDiagram> }`. Each branch in the oneOf
+// Root shape: `{ diagrams: Array<WireDiagram> }`. Each branch in the anyOf
 // closes (additionalProperties: false) and every property is in required.
 // Discriminator is `kind` via per-branch `const`.
 //
@@ -371,8 +371,17 @@ export const WIRE_SCHEMA = {
   properties: {
     diagrams: {
       type: 'array',
+      // Sprint H Wave 4 fix (DRIFT-test3-024): OpenAI strict-mode response_format
+      // does NOT permit `oneOf` at any depth ("Invalid schema for response_format
+      // 'extracted_diagrams': In context=('properties','diagrams','items'),
+      // 'oneOf' is not permitted"). `anyOf` IS permitted and is semantically
+      // equivalent here because the 6 branches are mutually exclusive by `kind`.
+      // The Wave 0.5 spike validated individual kind shapes but did NOT exercise
+      // the top-level discriminated-union shape across multiple kinds — that
+      // gap let the 0/5 Wave-4 result surface. Lesson recorded for the next
+      // schema-compat spike.
       items: {
-        oneOf: [
+        anyOf: [
           comparisonTableBranch,
           definitionListBranch,
           diagramFlowBranch,
