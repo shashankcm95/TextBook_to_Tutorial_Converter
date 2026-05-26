@@ -23,6 +23,10 @@ import React from 'react';
 import { parseDiagramBlock } from '@/lib/diagrams/parse';
 import { ComparisonTable } from './ComparisonTable';
 import { DefinitionList } from './DefinitionList';
+import DiagramFlow from './DiagramFlow';
+import StateTransitionDiagram from './StateTransitionDiagram';
+import SequenceDiagram from './SequenceDiagram';
+import DecisionTree from './DecisionTree';
 
 export function DiagramBlock({ rawJSON }: { rawJSON: string }) {
   const result = parseDiagramBlock(rawJSON);
@@ -37,14 +41,14 @@ export function DiagramBlock({ rawJSON }: { rawJSON: string }) {
       return <ComparisonTable payload={payload} />;
     case 'DefinitionList':
       return <DefinitionList payload={payload} />;
-    // Sprint F.2 primitives: render-pending. We mark them visually so the
-    // empirical signal from production tells us which shapes the LLM is
-    // emitting before we invest in their SVG layout code.
     case 'DiagramFlow':
+      return <DiagramFlow payload={payload} />;
     case 'StateTransitionDiagram':
+      return <StateTransitionDiagram payload={payload} />;
     case 'SequenceDiagram':
+      return <SequenceDiagram payload={payload} />;
     case 'DecisionTree':
-      return <DiagramPending kind={payload.kind} rawJSON={rawJSON} />;
+      return <DecisionTree payload={payload} />;
     default: {
       // Exhaustiveness — TypeScript narrows `payload` to `never` here. If
       // a new primitive is added to the schema without a case above,
@@ -80,11 +84,17 @@ function DiagramFallback({
   );
 }
 
-function DiagramPending({
+// DiagramPending stays for future schema variants; current 6 primitives all
+// route to real renderers. When Sprint G adds a 7th `kind`, the router's
+// default-exhaustiveness check will fire a compile error, and this component
+// is the natural soft-landing while the new primitive's SVG layout is built.
+// Kept exported so a future PR can route to it from the switch without a
+// name re-introduction.
+export function DiagramPending({
   kind,
   rawJSON,
 }: {
-  kind: 'DiagramFlow' | 'StateTransitionDiagram' | 'SequenceDiagram' | 'DecisionTree';
+  kind: string;
   rawJSON: string;
 }) {
   return (

@@ -26,6 +26,12 @@ data/
 # Generated tutorials (cached LLM output)
 .tutorials-cache/
 
+# Playwright runtime artifacts (baseline PNGs in tests/playwright/*-snapshots/
+# ARE committed; runtime test-results/ + *-actual.png + *-diff.png are not)
+test-results/
+**/*-actual.png
+**/*-diff.png
+
 # OS noise
 .DS_Store
 Thumbs.db

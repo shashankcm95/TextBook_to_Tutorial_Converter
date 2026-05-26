@@ -177,6 +177,83 @@ describe('runEvalHarness — end-to-end with mocked LLM + filesystem fixtures', 
     ).toBe(true);
   });
 
+  it('threads diagram-density into the report when narratives contain ```diagram blocks', async () => {
+    // Overwrite the ch0 fixture with a narrative that emits a valid
+    // ```diagram ComparisonTable block. ch1 stays prose-only — its density
+    // row should show all zeros.
+    const ch0Diagram = [
+      '# narrative 0',
+      '',
+      'Some prose here.',
+      '',
+      '```diagram',
+      JSON.stringify({
+        kind: 'ComparisonTable',
+        columns: ['A', 'B'],
+        rows: [{ A: '1', B: '2' }],
+      }),
+      '```',
+      '',
+      'More prose.',
+    ].join('\n');
+    fs.writeFileSync(path.join(sandbox, 'fx/v3/ch0.md'), ch0Diagram);
+
+    const client = mockClient();
+    const result = await runEvalHarness({
+      runId: 'smoke-density',
+      repoRoot: sandbox,
+      variantPaths: ['variants/v3.json'],
+      personaSlugs: ['tester'],
+      rateRuns: 1,
+      narrativeSourceForVariant: (variant): NarrativeSource => ({
+        type: 'filesystem',
+        dir: path.resolve(sandbox, 'fx', variant.name),
+      }),
+      chatClient: client,
+      logger: () => undefined,
+    });
+
+    const report = fs.readFileSync(path.join(result.outDir, 'report.md'), 'utf8');
+    // The density section is present.
+    expect(report).toContain('## Diagram emission density');
+    // The ComparisonTable column for ch0 is 1 (from the embedded block).
+    // The header row mentions ComparisonTable; the v3/ch0 row counts 1.
+    const lines = report.split('\n');
+    const ch0Row = lines.find((l) => /^\| v3 \| 0 \|/.test(l));
+    expect(ch0Row).toBeTruthy();
+    // First numeric cell after Variant + Chapter is ComparisonTable.
+    expect(ch0Row!).toMatch(/^\| v3 \| 0 \| 1 \|/);
+  });
+
+  it('renders the diagram-density section with all-zero counts when no ```diagram blocks are emitted', async () => {
+    // Default ch0/ch1 fixtures are pure prose ("# narrative 0\n\ncontent")
+    // — they produce all-zero densities. The runner still threads the (all-
+    // zero) map through; the report's per-row table renders zero counts but
+    // the section header is present. That's the expected behavior — the
+    // section omits ONLY when the diagramDensityByVariant arg is missing
+    // entirely; the runner always supplies it. We assert the header is
+    // present AND the zero-row is present.
+    const client = mockClient();
+    const result = await runEvalHarness({
+      runId: 'smoke-density-empty',
+      repoRoot: sandbox,
+      variantPaths: ['variants/v3.json'],
+      personaSlugs: ['tester'],
+      rateRuns: 1,
+      narrativeSourceForVariant: (variant): NarrativeSource => ({
+        type: 'filesystem',
+        dir: path.resolve(sandbox, 'fx', variant.name),
+      }),
+      chatClient: client,
+      logger: () => undefined,
+    });
+
+    const report = fs.readFileSync(path.join(result.outDir, 'report.md'), 'utf8');
+    expect(report).toContain('## Diagram emission density');
+    // All-zero per-kind counts for v3/ch0.
+    expect(report).toMatch(/^\| v3 \| 0 \| 0 \| 0 \| 0 \| 0 \| 0 \| 0 \| 0 \| 0 \|/m);
+  });
+
   it('rejects rateRuns < 1', async () => {
     await expect(
       runEvalHarness({

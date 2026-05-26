@@ -18,6 +18,7 @@
     "db:seed": "tsx src/db/seed.ts",
     "test": "vitest run",
     "test:phase0": "bash scripts/phase0-gate.sh",
+    "test:playwright": "playwright test --config tests/playwright/playwright-setup.ts",
     "eval:run": "tsx scripts/ab-compare.ts"
   },
   "dependencies": {
@@ -43,6 +44,7 @@
     "zod": "3.23.8"
   },
   "devDependencies": {
+    "@playwright/test": "^1.49.0",
     "@testing-library/dom": "10.4.0",
     "@testing-library/jest-dom": "6.4.8",
     "@testing-library/react": "16.0.1",

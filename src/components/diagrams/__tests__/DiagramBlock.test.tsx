@@ -152,25 +152,78 @@ describe('DiagramBlock — parse-failure fallback', () => {
   });
 });
 
-describe('DiagramBlock — Sprint F.2 pending (SVG primitives not yet shipped)', () => {
-  it('shows a "renderer pending" placeholder for DiagramFlow', () => {
+describe('DiagramBlock — F.2 SVG primitives', () => {
+  it('renders DiagramFlow with N nodes (real component, not pending placeholder)', () => {
     renderJSON({
       kind: 'DiagramFlow',
       nodes: [
-        { id: 'a', label: 'A' },
-        { id: 'b', label: 'B' },
+        { id: 'a', label: 'Alpha' },
+        { id: 'b', label: 'Beta' },
+        { id: 'c', label: 'Gamma' },
       ],
-      edges: [{ from: 'a', to: 'b' }],
+      edges: [
+        { from: 'a', to: 'b' },
+        { from: 'b', to: 'c' },
+      ],
     });
-    expect(screen.getByText(/DiagramFlow renderer ships in Sprint F\.2/)).toBeTruthy();
+    // ≥ nodes.length <text> elements for node labels.
+    const texts = document.querySelectorAll('svg text');
+    expect(texts.length).toBeGreaterThanOrEqual(3);
+    // role="img" on the outer figure with a truthy aria-label.
+    expect(screen.getByRole('img').getAttribute('aria-label')).toBeTruthy();
+    // No pending-placeholder text.
+    expect(screen.queryByText(/renderer ships in Sprint F\.2/)).toBeNull();
   });
 
-  it('shows a "renderer pending" placeholder for SequenceDiagram', () => {
+  it('renders StateTransitionDiagram with N states (real component)', () => {
+    renderJSON({
+      kind: 'StateTransitionDiagram',
+      states: [
+        { id: 's1', label: 'Idle', initial: true },
+        { id: 's2', label: 'Active' },
+        { id: 's3', label: 'Done', terminal: true },
+      ],
+      transitions: [
+        { from: 's1', to: 's2', trigger: 'start' },
+        { from: 's2', to: 's3', trigger: 'finish' },
+      ],
+    });
+    const texts = document.querySelectorAll('svg text');
+    expect(texts.length).toBeGreaterThanOrEqual(3);
+    expect(screen.getByRole('img').getAttribute('aria-label')).toBeTruthy();
+    expect(screen.queryByText(/renderer ships in Sprint F\.2/)).toBeNull();
+  });
+
+  it('renders SequenceDiagram with actors + messages (real component)', () => {
     renderJSON({
       kind: 'SequenceDiagram',
       actors: ['Client', 'Server'],
-      messages: [{ from: 'Client', to: 'Server', label: 'GET /' }],
+      messages: [
+        { from: 'Client', to: 'Server', label: 'GET /' },
+        { from: 'Server', to: 'Client', label: '200 OK', kind: 'return' },
+      ],
     });
-    expect(screen.getByText(/SequenceDiagram renderer ships in Sprint F\.2/)).toBeTruthy();
+    // ≥ actors.length + messages.length text elements (actor headers +
+    // message labels, minimum).
+    const texts = document.querySelectorAll('svg text');
+    expect(texts.length).toBeGreaterThanOrEqual(4);
+    expect(screen.getByRole('img').getAttribute('aria-label')).toBeTruthy();
+    expect(screen.queryByText(/renderer ships in Sprint F\.2/)).toBeNull();
+  });
+
+  it('renders DecisionTree with internal nodes + leaves (real component)', () => {
+    renderJSON({
+      kind: 'DecisionTree',
+      root: {
+        question: 'Is it raining?',
+        yes: { leaf: 'Bring umbrella' },
+        no: { leaf: 'Wear sunglasses' },
+      },
+    });
+    // 1 internal node + 2 leaves → ≥ 3 text elements.
+    const texts = document.querySelectorAll('svg text');
+    expect(texts.length).toBeGreaterThanOrEqual(3);
+    expect(screen.getByRole('img').getAttribute('aria-label')).toBeTruthy();
+    expect(screen.queryByText(/renderer ships in Sprint F\.2/)).toBeNull();
   });
 });
