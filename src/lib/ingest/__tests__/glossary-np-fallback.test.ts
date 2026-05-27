@@ -351,6 +351,47 @@ describe('refineCandidatesWithLLM', () => {
     expect(result[0]!.term).toBe('good');
   });
 
+  // Regression — PR #46 wire-format bug. The REFINE_SYSTEM_PROMPT instructs
+  // the LLM to emit `source_paragraph_ref` (snake_case), so the parser must
+  // accept that shape. The original PR-46 parser only checked
+  // `sourceParagraphRef` (camelCase), silently dropping every real LLM
+  // response and yielding 0-term glossaries for every post-PR-46 ingest.
+  // Discovered during deployment-gap closure 2026-05-27.
+  it('parses the snake_case source_paragraph_ref key the system prompt asks for', async () => {
+    createMock.mockResolvedValue(
+      mockResponse(
+        JSON.stringify({
+          terms: [
+            {
+              term: 'Batch Processing',
+              definition: 'Executing a series of jobs without manual intervention.',
+              source_paragraph_ref: 'page413:paragraph1',
+            },
+            {
+              term: 'Stream Processing',
+              definition: 'Real-time processing of continuous data streams.',
+              source_paragraph_ref: 'page464:paragraph32',
+            },
+          ],
+        }),
+      ),
+    );
+    const result = await refineCandidatesWithLLM(
+      [
+        { term: 'Batch Processing', count: 8, firstParagraphRef: 'page413:paragraph1' },
+        { term: 'Stream Processing', count: 5, firstParagraphRef: 'page464:paragraph32' },
+      ],
+      [makeParagraph(413, 1, 'A batch job runs without intervention.')],
+    );
+    expect(result).toHaveLength(2);
+    expect(result[0]).toEqual({
+      term: 'Batch Processing',
+      definition: 'Executing a series of jobs without manual intervention.',
+      sourceParagraphRef: 'page413:paragraph1',
+    });
+    expect(result[1]!.sourceParagraphRef).toBe('page464:paragraph32');
+  });
+
   it('returns empty list when the LLM response is malformed JSON (fail-open)', async () => {
     createMock.mockResolvedValue(mockResponse('this is not json {{{'));
     const result = await refineCandidatesWithLLM(
