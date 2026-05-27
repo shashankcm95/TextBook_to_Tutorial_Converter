@@ -369,20 +369,30 @@ export async function refineCandidatesWithLLM(
   const refined: RefinedTerm[] = [];
   const o = parsed as { terms?: unknown };
   if (Array.isArray(o.terms)) {
-    for (const t of o.terms as Array<Partial<RefinedTerm>>) {
+    for (const raw of o.terms as Array<Record<string, unknown>>) {
+      // PR-46 bug fix: REFINE_SYSTEM_PROMPT instructs the LLM to emit
+      // `source_paragraph_ref` (snake_case), but the original parser checked
+      // `sourceParagraphRef` (camelCase) — 100% drop rate against the real
+      // wire format, silently fail-open to an empty glossary. Read the
+      // snake_case key the prompt actually asks for; accept the camelCase
+      // alias too so mocked tests + any future schema flip both work.
+      const term = raw?.term;
+      const definition = raw?.definition;
+      const ref =
+        (raw?.source_paragraph_ref as unknown) ?? (raw?.sourceParagraphRef as unknown);
       if (
-        typeof t?.term === 'string' &&
-        typeof t?.definition === 'string' &&
-        typeof t?.sourceParagraphRef === 'string' &&
-        t.term.length > 0 &&
-        t.definition.length > 0 &&
+        typeof term === 'string' &&
+        typeof definition === 'string' &&
+        typeof ref === 'string' &&
+        term.length > 0 &&
+        definition.length > 0 &&
         // Match the ref-shape guard from glossary-extract.ts for parity.
-        /^page\d+:paragraph\d+$/.test(t.sourceParagraphRef)
+        /^page\d+:paragraph\d+$/.test(ref)
       ) {
         refined.push({
-          term: t.term.slice(0, 200),
-          definition: t.definition.slice(0, 500),
-          sourceParagraphRef: t.sourceParagraphRef,
+          term: term.slice(0, 200),
+          definition: definition.slice(0, 500),
+          sourceParagraphRef: ref,
         });
       }
     }
