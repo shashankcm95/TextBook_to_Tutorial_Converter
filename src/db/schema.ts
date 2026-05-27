@@ -434,6 +434,13 @@ export const chapterFidelityScores = sqliteTable(
     // these alongside the original "preserved/missing" tallies above.
     whitelistAnchorsPreserved: integer('whitelist_anchors_preserved'),
     whitelistAnchorsMissing: integer('whitelist_anchors_missing'),
+    // ── Q3 v3 adjacent-pair gate (0007 migration) ──
+    // Soft-metric counts from the pure-function detector in
+    // src/lib/citations/adjacent-pair-gate.ts. Nullable so rows scored before
+    // Q3 v3 landed remain valid; new scores populate them alongside the
+    // anchor-aware fields above. See SI-citation-pair-laundering-001.
+    adjacentPairCount: integer('adjacent_pair_count'),
+    adjacentPairPenalty: real('adjacent_pair_penalty'),
     overallScore: integer('overall_score').notNull(),
     notesJson: text('notes_json').notNull().default('[]'),
     model: text('model').notNull(),

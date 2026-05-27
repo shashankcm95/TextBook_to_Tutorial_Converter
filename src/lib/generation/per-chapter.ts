@@ -57,6 +57,7 @@ import {
   readAnchorWhitelist,
 } from '@/lib/s3-chunks';
 import { validateAnchors, type AnchorWhitelistEntry } from '@/lib/openai/anchor-validator';
+import { detectAdjacentPairViolations } from '@/lib/citations/adjacent-pair-gate';
 import type { VoiceProfile } from '@/lib/ingest/voice-extract';
 import type { SourceParagraph } from '@/lib/types';
 
@@ -460,6 +461,23 @@ export async function generateChapter(
     }
   });
 
+  // ── 6.5. Adjacent-pair citation gate (Q3 v3 — soft metric) ─────────────
+  // Pure function. Detects two violation kinds in the woven narrative:
+  //   - 'cross-page'         (likely span hallucination, ch56 case)
+  //   - 'same-page-gap-gt-2' (range-ban laundering, ch36/ch40 case)
+  // OBSERVABILITY-only in v1 — we log + persist the count + penalty score,
+  // but DO NOT reject or retry. A later PR (Q3 v4) will promote this to a
+  // hard gate once we have production traffic data to set thresholds with
+  // confidence. See SI-citation-pair-laundering-001.
+  const adjPairGate = detectAdjacentPairViolations(wovenNarrative);
+  // eslint-disable-next-line no-console
+  console.log(
+    `[adj-pair-gate] chapter=${chapter.id} ord=${chapterIdx} ` +
+      `totalRefs=${adjPairGate.totalRefs} adjacentPairs=${adjPairGate.adjacentPairs} ` +
+      `violations=${adjPairGate.violations.length} ` +
+      `penalty=${adjPairGate.penaltyScore.toFixed(3)}`,
+  );
+
   // ── 7. Score narrative-vs-source fidelity (DRIFT-test3-022) ──────────
   // Run a separate 4o-mini call to count preserved concrete anchors. Fail-
   // open: if the scorer errors, we proceed without a score (the chapter is
@@ -499,6 +517,11 @@ export async function generateChapter(
           // ran without a whitelist (pre-Feature-B' tutorials).
           whitelistAnchorsPreserved: fidelity.whitelistAnchorsPreserved,
           whitelistAnchorsMissing: fidelity.whitelistAnchorsMissing,
+          // Q3 v3 adjacent-pair soft metric (migration 0007). Soft = persisted
+          // but NOT used as a rejection signal in v1; promotion to hard gate
+          // is queued as Q3 v4 after we have production-traffic baselines.
+          adjacentPairCount: adjPairGate.adjacentPairs,
+          adjacentPairPenalty: adjPairGate.penaltyScore,
           model: fidelity.model,
           promptTokens: fidelity.promptTokens,
           completionTokens: fidelity.completionTokens,
