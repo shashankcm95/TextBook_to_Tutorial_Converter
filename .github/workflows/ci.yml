@@ -1,0 +1,76 @@
+name: CI
+
+# Personal-use CI: run the test suite on every PR and on pushes to main.
+#
+# Scope is intentionally tight:
+#   - Tests only (vitest run). 640 tests, ~10s wall.
+#   - Pinned to the toolchain versions package.json declares
+#     (Node 22+, pnpm 9), so divergence between local and CI cannot
+#     creep in silently.
+#
+# NOT in CI (deferred):
+#   - `pnpm lint` — pre-existing `@typescript-eslint/no-explicit-any rule
+#     not found` config noise on main. Add once .eslintrc.json is repaired.
+#   - `tsc --noEmit` — pre-existing TS errors on main (10 in 4 files:
+#     parse.kind.test.ts, parse.ts, s3.ts, srs/leitner.ts). Add once cleaned.
+#   - Playwright e2e — requires a running app + a stub OPENAI_API_KEY.
+#     Worth wiring later if regressions slip past unit-level coverage.
+#   - Coverage gate — not yet meaningful for personal-use polish.
+#
+# Triggering on PR + push-to-main is sufficient for a single-user
+# workflow. The `cancel-in-progress` concurrency setting saves CI minutes
+# when a PR receives a rapid push sequence.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Cancel an in-progress run for the same ref when a new commit arrives.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Drop GITHUB_TOKEN to read-only by default. The test job needs no write
+# access; if a future job needs to comment on a PR or push a tag, scope
+# that job's permissions inline.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Unit tests (vitest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Set up pnpm BEFORE Node so the Node setup step can use pnpm's
+      # store path for caching. Version pinned to match package.json's
+      # `packageManager: pnpm@9.0.0` — divergence here would silently
+      # disagree with `corepack` resolution locally.
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.0.0
+          run_install: false
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        # --frozen-lockfile fails the build if pnpm-lock.yaml is stale
+        # relative to package.json, which is exactly what CI should catch.
+        run: pnpm install --frozen-lockfile
+
+      - name: Run tests
+        # `vitest run` (one-shot, no watch) — same command as `pnpm test`.
+        # Tests do not require OPENAI_API_KEY (the OpenAI client is mocked
+        # at module-load via vi.mock); verified locally 2026-05-27.
+        run: pnpm test
